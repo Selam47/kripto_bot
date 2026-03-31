@@ -1,17 +1,46 @@
+"""
+Notification Manager — Async Telegram Gateway
+===============================================
+Handles all outbound Telegram communication and inbound command handling in a
+single dedicated ``asyncio`` event loop running on a background daemon thread.
+
+Features
+--------
+- **Non-blocking**: signal messages are dispatched via
+  ``asyncio.run_coroutine_threadsafe`` so the trading engine never waits for
+  network I/O.
+- **aiohttp session**: a single persistent ``aiohttp.ClientSession`` is reused
+  across all requests to minimise TCP overhead.
+- **Retry logic**: every send is retried up to 3 times with linear back-off;
+  a sync ``requests`` fallback fires on loop failure.
+- **Telegram commands**: ``/start``, ``/durum``, ``/coinler``, ``/hakkinda``
+  are registered via ``python-telegram-bot`` and polled inside the same event
+  loop using the Application's low-level async API.
+- **Singleton**: only one instance is created per process.
+
+Thread safety
+-------------
+``send_signal()`` is safe to call from any thread.  The asyncio loop itself
+runs exclusively on the ``NotificationLoop`` daemon thread.
+"""
+
 import asyncio
 import logging
 import os
 import threading
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import aiohttp
 
 import config
 from engine.confluence import SignalResult
 
+if TYPE_CHECKING:
+    pass
+
 logger = logging.getLogger(__name__)
 
-READABLE_MAP = {
+_READABLE_MAP: dict[str, str] = {
     "EMA_9/21_GOLDEN_CROSS": "EMA Golden Cross",
     "EMA_BULLISH_ALIGNMENT": "EMA Bullish",
     "EMA_9/21_DEATH_CROSS": "EMA Death Cross",
@@ -39,12 +68,12 @@ READABLE_MAP = {
     "HAMMER": "Cekic",
     "SHOOTING_STAR": "Kayan Yildiz",
     "FIB_0.618_GOLDEN_POCKET": "Fib 0.618 Altin Cep",
-    "FIB_0.786_DEEP_RETRACE": "Fib 0.786 Derin Geri Cekilme",
+    "FIB_0.786_DEEP_RETRACE": "Fib 0.786 Derin Cekilis",
     "FIB_0.500_MIDPOINT": "Fib 0.500 Orta Nokta",
     "FIB_0.382_SHALLOW": "Fib 0.382 Yuzeysel",
 }
 
-TREND_MAP = {
+_TREND_MAP: dict[str, str] = {
     "STRONG_BULL": "Guclu Yukselis",
     "BULL": "Yukselis",
     "NEUTRAL": "Notr",
@@ -52,13 +81,33 @@ TREND_MAP = {
     "STRONG_BEAR": "Guclu Dusus",
 }
 
+_TF_LABEL: dict[str, str] = {
+    "5m": "Scalp",
+    "15m": "Kisa Vadeli",
+    "30m": "Orta-Kisa Vadeli",
+    "1h": "Orta Vadeli",
+    "4h": "Uzun Vadeli",
+    "1d": "Cok Uzun Vadeli",
+}
+
 
 class NotificationManager:
+    """
+    Singleton async Telegram notification gateway with built-in command handling.
+
+    Lifecycle
+    ---------
+    1. ``start()`` — launches the background event loop thread and initialises
+       the aiohttp session and Telegram command polling.
+    2. ``send_signal(...)`` — schedules an outbound message from any thread.
+    3. ``stop()`` — gracefully shuts down polling, the session, and the loop.
+    """
 
     _instance: Optional["NotificationManager"] = None
     _init_lock = threading.Lock()
 
     def __new__(cls, *args, **kwargs):
+        """Enforce singleton pattern."""
         if cls._instance is None:
             with cls._init_lock:
                 if cls._instance is None:
@@ -66,45 +115,146 @@ class NotificationManager:
         return cls._instance
 
     def __init__(self):
-        if hasattr(self, "_initialized") and self._initialized:
+        """Initialise internal state (idempotent — subsequent calls are no-ops)."""
+        if getattr(self, "_initialized", False):
             return
         self._initialized = True
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._session: Optional[aiohttp.ClientSession] = None
-        self._send_msg_url = config.TELEGRAM_SEND_MESSAGE_URL
-        self._send_photo_url = config.TELEGRAM_SEND_PHOTO_URL
-        self._chat_id = config.TELEGRAM_CHAT_ID
+        self._tg_app = None
+        self._stop_event = threading.Event()
 
     def start(self):
+        """
+        Start the background asyncio event loop thread.
+
+        Initialises the aiohttp session and — if ``TELEGRAM_BOT_TOKEN`` is
+        configured — starts ``python-telegram-bot``'s long-poll updater for
+        command handling.  This method blocks until the loop is confirmed
+        running.
+        """
+        if self._thread and self._thread.is_alive():
+            logger.debug("NotificationManager already running")
+            return
+
         self._loop = asyncio.new_event_loop()
+        ready = threading.Event()
         self._thread = threading.Thread(
-            target=self._run_loop, name="NotificationLoop", daemon=True
+            target=self._run_loop,
+            args=(ready,),
+            name="NotificationLoop",
+            daemon=True,
         )
         self._thread.start()
+        ready.wait(timeout=10)
         logger.info("NotificationManager async loop started")
 
-    def _run_loop(self):
-        asyncio.set_event_loop(self._loop)
-        self._loop.run_until_complete(self._init_session())
-        self._loop.run_forever()
+    def _run_loop(self, ready_event: threading.Event):
+        """
+        Entry point for the background notification thread.
 
-    async def _init_session(self):
+        Args:
+            ready_event: Set once the loop is up and the session is initialised.
+        """
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop.run_until_complete(self._bootstrap(ready_event))
+            self._loop.run_forever()
+        except Exception as e:
+            logger.error(f"Notification loop crashed: {e}", exc_info=True)
+        finally:
+            try:
+                self._loop.run_until_complete(self._cleanup())
+            except Exception:
+                pass
+            self._loop.close()
+
+    async def _bootstrap(self, ready_event: threading.Event):
+        """
+        Async initialisation: create aiohttp session and start Telegram polling.
+
+        Args:
+            ready_event: Signalled once initialisation is complete.
+        """
         timeout = aiohttp.ClientTimeout(total=20)
         self._session = aiohttp.ClientSession(timeout=timeout)
 
-    async def stop(self):
+        if config.TELEGRAM_BOT_TOKEN:
+            await self._start_command_polling()
+
+        ready_event.set()
+
+    async def _start_command_polling(self):
+        """
+        Register Telegram command handlers and start the updater.
+
+        Commands registered
+        -------------------
+        - ``/start``    — Welcome message and command list.
+        - ``/durum``    — Current bot status.
+        - ``/coinler``  — List of tracked coins.
+        - ``/hakkinda`` — About the bot.
+        """
+        try:
+            from telegram.ext import Application, CommandHandler
+
+            app = (
+                Application.builder()
+                .token(config.TELEGRAM_BOT_TOKEN)
+                .build()
+            )
+
+            app.add_handler(CommandHandler("start", _cmd_start))
+            app.add_handler(CommandHandler("durum", _cmd_durum))
+            app.add_handler(CommandHandler("coinler", _cmd_coinler))
+            app.add_handler(CommandHandler("hakkinda", _cmd_hakkinda))
+
+            await app.initialize()
+            await app.start()
+            await app.updater.start_polling(drop_pending_updates=True)
+
+            self._tg_app = app
+            logger.info("Telegram command polling started (/start /durum /coinler /hakkinda)")
+        except Exception as e:
+            logger.warning(f"Telegram command polling unavailable: {e}")
+
+    def stop(self):
+        """
+        Gracefully stop the notification manager.
+
+        Stops Telegram polling, closes the aiohttp session, signals the event
+        loop to stop, and joins the background thread.
+        """
+        logger.info("Stopping NotificationManager...")
+        self._stop_event.set()
+
         if self._loop and self._loop.is_running():
             asyncio.run_coroutine_threadsafe(self._cleanup(), self._loop)
             self._loop.call_soon_threadsafe(self._loop.stop)
-        if self._thread:
-            self._thread.join(timeout=5)
+
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=8)
+
         logger.info("NotificationManager stopped")
 
     async def _cleanup(self):
+        """
+        Async teardown: stop Telegram polling and close the HTTP session.
+        """
+        if self._tg_app:
+            try:
+                await self._tg_app.updater.stop()
+                await self._tg_app.stop()
+                await self._tg_app.shutdown()
+            except Exception as e:
+                logger.debug(f"Telegram app cleanup: {e}")
+            self._tg_app = None
+
         if self._session and not self._session.closed:
             await self._session.close()
+            self._session = None
 
     def send_signal(
         self,
@@ -119,6 +269,25 @@ class NotificationManager:
         chart_path: Optional[str] = None,
         higher_tf_trend: str = "",
     ):
+        """
+        Schedule a signal notification to be sent via Telegram.
+
+        This method is **non-blocking** and thread-safe.  It formats the
+        message and hands it off to the async event loop.
+
+        Args:
+            symbol:           Trading pair (e.g. ``'BTCUSDT'``).
+            interval:         Timeframe string (e.g. ``'1h'``).
+            entry_prices:     List with the entry price as the first element.
+            tp_list:          List of take-profit prices (TP1, TP2, TP3).
+            sl:               Stop-loss price.
+            leverage:         Recommended leverage (e.g. ``20``).
+            margin_type:      ``'ISOLATED'`` or ``'CROSS'``.
+            signal_result:    Full ``SignalResult`` object for detailed analysis
+                              section; pass ``None`` to omit.
+            chart_path:       Filesystem path to a chart image, or ``None``.
+            higher_tf_trend:  Higher-timeframe trend label for the message footer.
+        """
         msg = self._format_message(
             symbol, interval, entry_prices, tp_list, sl,
             leverage, margin_type, signal_result, higher_tf_trend,
@@ -132,30 +301,40 @@ class NotificationManager:
                 self._async_send(msg, chart_path), self._loop
             )
         else:
-            logger.warning("Notification loop not running, using sync fallback")
+            logger.warning("Notification loop not running — using sync fallback")
             self._sync_send(msg, chart_path)
 
-    async def _async_send(self, text: str, chart_path: Optional[str], max_retries: int = 3):
+    async def _async_send(
+        self, text: str, chart_path: Optional[str], max_retries: int = 3
+    ):
+        """
+        Attempt to send a Telegram message with retries and linear back-off.
+
+        If a chart file is provided and valid (1 KB – 20 MB), it is sent as a
+        photo caption; otherwise a plain text message is sent.  On final
+        failure the text message is attempted without the image.
+
+        Args:
+            text:        Message body.
+            chart_path:  Optional path to a chart PNG.
+            max_retries: Maximum send attempts (default 3).
+        """
         for attempt in range(max_retries):
             try:
                 if chart_path and os.path.exists(chart_path):
-                    file_size = os.path.getsize(chart_path)
-                    if 1024 <= file_size <= 20 * 1024 * 1024:
-                        success = await self._send_photo(text, chart_path)
-                        if success:
-                            logger.info(f"Signal sent with chart (attempt {attempt + 1})")
+                    size = os.path.getsize(chart_path)
+                    if 1024 <= size <= 20 * 1024 * 1024:
+                        if await self._send_photo(text, chart_path):
                             return
 
-                success = await self._send_text(text)
-                if success:
-                    logger.info(f"Signal sent (attempt {attempt + 1})")
+                if await self._send_text(text):
                     return
 
             except Exception as e:
-                logger.error(f"Send attempt {attempt + 1} failed: {e}")
+                logger.error(f"Send attempt {attempt + 1}/{max_retries} failed: {e}")
 
             if attempt < max_retries - 1:
-                await asyncio.sleep(1.0 * (attempt + 1))
+                await asyncio.sleep(float(attempt + 1))
 
         try:
             await self._send_text(text)
@@ -163,37 +342,92 @@ class NotificationManager:
             logger.error(f"Final send attempt failed: {e}")
 
     async def _send_text(self, text: str) -> bool:
-        if not self._session or not self._send_msg_url:
+        """
+        POST a plain-text message to the Telegram Bot API.
+
+        Args:
+            text: Message body (up to 4096 characters).
+
+        Returns:
+            ``True`` on HTTP 200 OK.
+        """
+        if not self._session or not config.TELEGRAM_SEND_MESSAGE_URL:
             return False
-        payload = {"chat_id": self._chat_id, "text": text}
-        async with self._session.post(self._send_msg_url, json=payload) as resp:
-            if resp.status == 200:
-                return True
-            body = await resp.text()
-            logger.error(f"Telegram API error {resp.status}: {body}")
-            return False
+        payload = {"chat_id": config.TELEGRAM_CHAT_ID, "text": text}
+        try:
+            async with self._session.post(
+                config.TELEGRAM_SEND_MESSAGE_URL, json=payload
+            ) as resp:
+                if resp.status == 200:
+                    return True
+                body = await resp.text()
+                logger.error(f"Telegram API {resp.status}: {body[:200]}")
+        except Exception as e:
+            logger.error(f"_send_text error: {e}")
+        return False
 
     async def _send_photo(self, caption: str, photo_path: str) -> bool:
-        if not self._session or not self._send_photo_url:
+        """
+        POST an image with a caption to the Telegram Bot API.
+
+        Args:
+            caption:    Message caption (truncated to 1024 characters).
+            photo_path: Filesystem path to the chart image.
+
+        Returns:
+            ``True`` on HTTP 200 OK.
+        """
+        if not self._session or not config.TELEGRAM_SEND_PHOTO_URL:
             return False
-        data = aiohttp.FormData()
-        data.add_field("chat_id", str(self._chat_id))
-        data.add_field("caption", caption[:1024])
-        data.add_field("photo", open(photo_path, "rb"), filename=os.path.basename(photo_path))
-        async with self._session.post(self._send_photo_url, data=data) as resp:
-            return resp.status == 200
+        try:
+            data = aiohttp.FormData()
+            data.add_field("chat_id", str(config.TELEGRAM_CHAT_ID))
+            data.add_field("caption", caption[:1024])
+            with open(photo_path, "rb") as f:
+                data.add_field(
+                    "photo", f,
+                    filename=os.path.basename(photo_path),
+                    content_type="image/png",
+                )
+                async with self._session.post(
+                    config.TELEGRAM_SEND_PHOTO_URL, data=data
+                ) as resp:
+                    return resp.status == 200
+        except Exception as e:
+            logger.error(f"_send_photo error: {e}")
+        return False
 
     def _sync_send(self, text: str, chart_path: Optional[str]):
-        import requests as req
+        """
+        Synchronous fallback sender using ``requests``.
+
+        Used when the async loop is unavailable (e.g. during startup/shutdown).
+
+        Args:
+            text:       Message body.
+            chart_path: Optional chart image path.
+        """
+        import requests
+
         try:
             if chart_path and os.path.exists(chart_path):
-                url = self._send_photo_url
-                with open(chart_path, "rb") as f:
-                    r = req.post(url, data={"chat_id": self._chat_id, "caption": text[:1024]}, files={"photo": f}, timeout=15)
-                    r.raise_for_status()
-                    return
-            payload = {"chat_id": self._chat_id, "text": text}
-            r = req.post(self._send_msg_url, json=payload, timeout=15)
+                size = os.path.getsize(chart_path)
+                if 1024 <= size <= 20 * 1024 * 1024:
+                    with open(chart_path, "rb") as f:
+                        r = requests.post(
+                            config.TELEGRAM_SEND_PHOTO_URL,
+                            data={"chat_id": config.TELEGRAM_CHAT_ID, "caption": text[:1024]},
+                            files={"photo": f},
+                            timeout=15,
+                        )
+                        r.raise_for_status()
+                        return
+
+            r = requests.post(
+                config.TELEGRAM_SEND_MESSAGE_URL,
+                json={"chat_id": config.TELEGRAM_CHAT_ID, "text": text},
+                timeout=15,
+            )
             r.raise_for_status()
         except Exception as e:
             logger.error(f"Sync send failed: {e}")
@@ -210,84 +444,162 @@ class NotificationManager:
         signal_result: Optional[SignalResult] = None,
         higher_tf_trend: str = "",
     ) -> str:
-        tf_label = {
-            "5m": "Scalp", "15m": "Kisa Vadeli", "30m": "Orta-Kisa Vadeli",
-            "1h": "Orta Vadeli", "4h": "Uzun Vadeli", "1d": "Cok Uzun Vadeli",
-        }.get(interval, "Sinyal")
+        """
+        Build the full Telegram signal message string.
 
-        entry = entry_prices[0] if entry_prices else 0
-        is_long = tp_list and tp_list[0] > entry
+        The message includes entry, TP levels with percentage offsets, SL,
+        risk/reward ratio, leverage, and — when ``signal_result`` is present —
+        a detailed technical analysis section.
+
+        Args:
+            symbol:          Trading pair.
+            interval:        Timeframe string.
+            entry_prices:    Entry price list.
+            tp_list:         Take-profit price list.
+            sl:              Stop-loss price.
+            leverage:        Leverage integer.
+            margin_type:     Margin type string.
+            signal_result:   Optional ``SignalResult`` for the analysis block.
+            higher_tf_trend: Higher-timeframe trend label.
+
+        Returns:
+            Formatted UTF-8 message string.
+        """
+        tf_label = _TF_LABEL.get(interval, "Sinyal")
+        entry = entry_prices[0] if entry_prices else 0.0
+        is_long = bool(tp_list and tp_list[0] > entry)
         signal_type = "AL (LONG)" if is_long else "SAT (SHORT)"
         emoji = "\U0001f680" if is_long else "\U0001f4c9"
 
-        def fmt(p):
+        def _fmt(p: float) -> str:
             if p < 0.01:
                 return f"{p:.6f}"
-            elif p < 1:
+            if p < 1.0:
                 return f"{p:.4f}"
-            elif p < 100:
+            if p < 100.0:
                 return f"{p:.3f}"
             return f"{p:.2f}"
 
         tp_lines = ""
-        for i, tp in enumerate(tp_list):
-            pct = ((tp - entry) / entry) * 100 if entry else 0
+        for i, tp in enumerate(tp_list, start=1):
+            pct = ((tp - entry) / entry * 100) if entry else 0.0
             sign = "+" if pct > 0 else ""
-            tp_lines += f"  TP{i+1}: {fmt(tp)}  ({sign}{pct:.1f}%)\n"
+            tp_lines += f"  TP{i}: {_fmt(tp)}  ({sign}{pct:.1f}%)\n"
 
-        sl_pct = ((sl - entry) / entry) * 100 if entry else 0
+        sl_pct = ((sl - entry) / entry * 100) if entry else 0.0
         risk = abs(entry - sl)
-        reward = abs(tp_list[0] - entry) if tp_list else 0
-        rr = reward / risk if risk > 0 else 0
+        reward = abs(tp_list[0] - entry) if tp_list else 0.0
+        rr = reward / risk if risk > 0 else 0.0
 
-        line = "-" * 30
-
+        sep = "-" * 30
         msg = (
             f"{emoji} {symbol.upper()} | {tf_label}\n"
-            f"{line}\n"
+            f"{sep}\n"
             f"SINYAL: {signal_type}\n\n"
-            f"Giris: {fmt(entry)}\n\n"
+            f"Giris: {_fmt(entry)}\n\n"
             f"{tp_lines}"
-            f"Stop Loss: {fmt(sl)}  ({sl_pct:.1f}%)\n"
+            f"Stop Loss: {_fmt(sl)}  ({sl_pct:.1f}%)\n"
             f"Risk/Odul: 1:{rr:.1f}\n"
-            f"{line}\n"
+            f"{sep}\n"
             f"Kaldirac: {leverage}x | {margin_type}\n"
         )
 
         if signal_result:
-            msg += self._format_confluence(signal_result, higher_tf_trend)
+            msg += self._format_confluence_block(signal_result, higher_tf_trend)
 
         msg += "\nBu bir finansal tavsiye degildir."
         return msg
 
-    def _format_confluence(self, sr: SignalResult, htf_trend: str = "") -> str:
-        conf_names = [READABLE_MAP.get(c, c) for c in sr.confluences]
-        trend_text = TREND_MAP.get(sr.trend_strength, sr.trend_strength)
-        confidence_pct = f"{sr.confidence:.0%}"
+    def _format_confluence_block(
+        self, sr: SignalResult, htf_trend: str = ""
+    ) -> str:
+        """
+        Build the technical analysis detail block appended to every signal.
 
-        if sr.confidence >= 0.75:
-            quality = "Yuksek Kalite"
-        elif sr.confidence >= 0.55:
-            quality = "Normal"
-        else:
-            quality = "Dusuk Guven"
+        Args:
+            sr:         ``SignalResult`` with confluences and metadata.
+            htf_trend:  Higher-timeframe trend string.
+
+        Returns:
+            Multi-line string starting with a blank line.
+        """
+        names = [_READABLE_MAP.get(c, c) for c in sr.confluences]
+        trend_text = _TREND_MAP.get(sr.trend_strength, sr.trend_strength)
+        pct = f"{sr.confidence:.0%}"
+
+        quality = (
+            "Yuksek Kalite" if sr.confidence >= 0.75
+            else "Normal" if sr.confidence >= 0.55
+            else "Dusuk Guven"
+        )
 
         lines = [
-            f"\nTeknik Analiz Detayi:",
-            f"  Guven: {confidence_pct} {quality}",
+            "",
+            "Teknik Analiz Detayi:",
+            f"  Guven: {pct} — {quality}",
             f"  Trend: {trend_text}",
         ]
-
-        if htf_trend:
-            htf_text = TREND_MAP.get(htf_trend, htf_trend)
-            lines.append(f"  Ust TF Trend: {htf_text}")
-
+        if htf_trend and htf_trend not in ("NO_HIGHER_TF", "ERROR", "PENDING"):
+            lines.append(f"  Ust TF Trend: {_TREND_MAP.get(htf_trend, htf_trend)}")
         if sr.fib_zone:
-            lines.append(f"  Fibonacci: {READABLE_MAP.get(sr.fib_zone, sr.fib_zone)}")
+            lines.append(f"  Fibonacci: {_READABLE_MAP.get(sr.fib_zone, sr.fib_zone)}")
 
-        lines.append(f"  Onaylar ({len(conf_names)}):")
-        for name in conf_names:
+        lines.append(f"  Onaylar ({len(names)}):")
+        for name in names:
             lines.append(f"    - {name}")
         lines.append(f"  ATR: {sr.atr_value:.4f}")
 
-        return "\n".join(lines)
+        return "\n".join(lines) + "\n"
+
+
+async def _cmd_start(update, context):
+    """Handle /start Telegram command."""
+    await update.message.reply_text(
+        "*Sinyal Botu Aktif!*\n\n"
+        "Komutlar:\n"
+        "/start    — Bu mesaj\n"
+        "/durum    — Bot durumu\n"
+        "/coinler  — Takip edilen coinler\n"
+        "/hakkinda — Bot hakkinda",
+        parse_mode="Markdown",
+    )
+
+
+async def _cmd_durum(update, context):
+    """Handle /durum Telegram command — report current bot status."""
+    mode = "Simulasyon" if config.SIMULATION_MODE else "Gercek Sinyal"
+    symbols = ", ".join(config.SYMBOLS) if config.SYMBOLS else "Otomatik secim"
+    timeframes = ", ".join(config.TIMEFRAMES)
+    await update.message.reply_text(
+        "*Bot Durumu*\n\n"
+        f"Mod: {mode}\n"
+        f"Coinler: {symbols}\n"
+        f"Zaman dilimleri: {timeframes}\n"
+        "Borsa: Binance Futures",
+        parse_mode="Markdown",
+    )
+
+
+async def _cmd_coinler(update, context):
+    """Handle /coinler Telegram command — list tracked coins."""
+    if config.SYMBOLS:
+        coin_lines = "\n".join(f"  {s}" for s in config.SYMBOLS)
+    else:
+        coin_lines = "  Otomatik secim aktif"
+    await update.message.reply_text(
+        f"*Takip Edilen Coinler:*\n\n{coin_lines}",
+        parse_mode="Markdown",
+    )
+
+
+async def _cmd_hakkinda(update, context):
+    """Handle /hakkinda Telegram command — about the bot."""
+    await update.message.reply_text(
+        "*Bot Hakkinda*\n\n"
+        "Bu bot Binance Futures verilerini analiz ederek "
+        "EMA, RSI, MACD, Bollinger Bands, Fibonacci ve diger "
+        "gostergelere gore AL/SAT sinyalleri uretir.\n\n"
+        "Uyari: Bu bir finansal tavsiye degildir. "
+        "Kendi arastirmanizi yapin.",
+        parse_mode="Markdown",
+    )

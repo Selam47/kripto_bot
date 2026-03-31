@@ -1,91 +1,153 @@
-import os
+"""
+Unified Configuration Module
+==============================
+Single source of truth for all bot parameters.
+Loads every setting from environment variables / .env file.
+Never hard-code credentials — always use the .env file.
+"""
 
+import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
-def _get_symbols_from_env() -> list[str]:
-    """Helper function to get symbols from the environment and handle empty values."""
-    env_symbols = os.getenv("SYMBOLS", "")
-    if env_symbols:
-        return [s.strip().upper() for s in env_symbols.split(",")]
-    return []
 
-def _get_timeframes_from_env() -> list[str]:
-    """Helper function to get timeframes from the environment with default values."""
-    env_timeframes = os.getenv("TIMEFRAMES", "15m,30m,1h,4h")
-    if env_timeframes:
-        return [tf.strip() for tf in env_timeframes.split(",")]
-    return ["15m", "30m", "1h", "4h"]
+def _bool(key: str, default: int = 0) -> bool:
+    """Parse a boolean environment variable from an integer string (0/1)."""
+    return int(os.getenv(key, str(default))) == 1
 
 
-BINANCE_WS_URL = os.getenv("BINANCE_WS_URL")
-BINANCE_ENV=os.getenv("BINANCE_ENV", "dev")
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
-BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
+def _float(key: str, default: float) -> float:
+    """Parse a float environment variable with a fallback default."""
+    try:
+        return float(os.getenv(key, str(default)))
+    except (ValueError, TypeError):
+        return default
 
 
-SYMBOLS = _get_symbols_from_env()
-TIMEFRAMES = _get_timeframes_from_env()
-
-MAX_LEVERAGE = os.getenv("MAX_LEVERAGE", "20")
-FILTER_BY_MARKET_CAP= True if int(os.getenv("FILTER_BY_MARKET_CAP", 0)) == 1 else False # Default false
-
-# Leverage-based TP/SL configuration
-LEVERAGE_BASED_TP_SL_ENABLED = True if int(os.getenv("LEVERAGE_BASED_TP_SL_ENABLED", 1)) == 1 else False
-LEVERAGE_BASE_RISK_PERCENT = float(os.getenv("LEVERAGE_BASE_RISK_PERCENT", "2.0"))  # Base risk per trade
-LEVERAGE_BASE_TP_PERCENT = float(os.getenv("LEVERAGE_BASE_TP_PERCENT", "1.0"))  # Base TP distance
-LEVERAGE_MIN_SL_DISTANCE = float(os.getenv("LEVERAGE_MIN_SL_DISTANCE", "0.1"))  # Minimum SL distance %
-LEVERAGE_MAX_SL_DISTANCE = float(os.getenv("LEVERAGE_MAX_SL_DISTANCE", "5.0"))  # Maximum SL distance %
-LEVERAGE_MIN_TP_DISTANCE = float(os.getenv("LEVERAGE_MIN_TP_DISTANCE", "0.2"))  # Minimum TP distance %
-LEVERAGE_MAX_TP_DISTANCE = float(os.getenv("LEVERAGE_MAX_TP_DISTANCE", "3.0"))  # Maximum TP distance %
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-TELEGRAM_SEND_MESSAGE_URL = os.getenv("TELEGRAM_SEND_MESSAGE_URL", "https://api.telegram.org/bot{token}/sendMessage").format(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
-TELEGRAM_SEND_PHOTO_URL = os.getenv("TELEGRAM_SEND_PHOTO_URL", "https://api.telegram.org/bot{token}/sendPhoto").format(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
-
-DEFAULT_SL_PERCENT = float(os.getenv("DEFAULT_SL_PERCENT", 0.02))
-DEFAULT_TP_PERCENTS = [float(x) for x in os.getenv("DEFAULT_TP_PERCENTS", "0.015,0.03,0.05,0.08").split(",")]
+def _int(key: str, default: int) -> int:
+    """Parse an integer environment variable with a fallback default."""
+    try:
+        return int(os.getenv(key, str(default)))
+    except (ValueError, TypeError):
+        return default
 
 
-HISTORY_CANDLES = int(os.getenv("HISTORY_CANDLES", 200))
-SIGNAL_COOLDOWN = int(os.getenv("SIGNAL_COOLDOWN", 600))
-DATA_TESTING = True if int(os.getenv("DATA_TESTING", 0))==1 else False # default false
-SIMULATION_MODE = True if int(os.getenv("SIMULATION_MODE", 0)) == 1 else False  # Default false
-
-# Lazy loading configuration for historical data
-LAZY_LOADING_ENABLED = True if int(os.getenv("LAZY_LOADING_ENABLED", 1)) == 1 else False  # Default true
-MAX_LAZY_LOAD_SYMBOLS = int(os.getenv("MAX_LAZY_LOAD_SYMBOLS", 100))  # Maximum symbols to lazy load historical data for
-MAX_CONCURRENT_LOADS = int(os.getenv("MAX_CONCURRENT_LOADS", 15))  # Maximum concurrent API requests for historical data
-
-# Symbol selection and limiting (production-ready)
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", 0)) if os.getenv("MAX_SYMBOLS") is not None else None  # Maximum symbols to monitor (None/undefined = unlimited)
-SYMBOL_SELECTION_STRATEGY = os.getenv("SYMBOL_SELECTION_STRATEGY", "quality").lower()  # quality, volume, random
-MIN_DAILY_VOLUME_USDT = float(os.getenv("MIN_DAILY_VOLUME_USDT", 1000000))  # Minimum $1M daily volume
-MIN_MARKET_CAP_USD = float(os.getenv("MIN_MARKET_CAP_USD", 0))  # Minimum market cap in USD (0 = disabled, requires CoinGecko)
-
-# Database configuration
-DB_PATH = os.getenv("DB_PATH", "trading_bot.db")  # SQLite database path
-DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", 10))  # Connection pool size
-DB_ENABLE_PERSISTENCE = True if int(os.getenv("DB_ENABLE_PERSISTENCE", 1)) == 1 else False  # Enable database persistence
-DB_CLEANUP_DAYS = int(os.getenv("DB_CLEANUP_DAYS", 7))  # Days to keep historical data (reduced from 30 to 7)
-
-# Database size management
-DB_MAX_SIZE_MB = float(os.getenv("DB_MAX_SIZE_MB", 200))  # Maximum database size in MB before cleanup
-DB_MAX_RECORDS = int(os.getenv("DB_MAX_RECORDS", 1000000))  # Maximum total records before cleanup
-DB_AUTO_CLEANUP_ENABLED = True if int(os.getenv("DB_AUTO_CLEANUP_ENABLED", 1)) == 1 else False  # Enable automatic cleanup
-DB_CLEANUP_INTERVAL_HOURS = int(os.getenv("DB_CLEANUP_INTERVAL_HOURS", 6))  # Hours between cleanup checks
-
-# Rate limiting configuration
-RATE_LIMITING_ENABLED = True if int(os.getenv("RATE_LIMITING_ENABLED", 1)) == 1 else False  # Enable rate limiting
-RATE_LIMIT_SAFETY_MARGIN = float(os.getenv("RATE_LIMIT_SAFETY_MARGIN", 0.1))  # 10% safety margin
-RATE_LIMIT_WARNING_THRESHOLD = float(os.getenv("RATE_LIMIT_WARNING_THRESHOLD", 0.8))  # 80% warning threshold
-RATE_LIMIT_MAX_WEIGHT_PER_MINUTE = int(os.getenv("RATE_LIMIT_MAX_WEIGHT_PER_MINUTE", 1200))  # Binance standard limit
-RATE_LIMIT_MAX_REQUESTS_PER_MINUTE = int(os.getenv("RATE_LIMIT_MAX_REQUESTS_PER_MINUTE", 1200))  # Binance standard limit
-RATE_LIMIT_RETRY_DELAY = float(os.getenv("RATE_LIMIT_RETRY_DELAY", 1.0))  # Retry delay in seconds
-RATE_LIMIT_MAX_RETRIES = int(os.getenv("RATE_LIMIT_MAX_RETRIES", 3))  # Maximum retry attempts
-RATE_LIMIT_DETAILED_LOGGING = True if int(os.getenv("RATE_LIMIT_DETAILED_LOGGING", 1)) == 1 else False  # Enable detailed logging
-RATE_LIMIT_LOG_INTERVAL = int(os.getenv("RATE_LIMIT_LOG_INTERVAL", 60))  # Log interval in seconds
+def _list_str(key: str, default: str = "") -> list[str]:
+    """Parse a comma-separated string environment variable into a list."""
+    raw = os.getenv(key, default).strip()
+    if not raw:
+        return []
+    return [s.strip().upper() for s in raw.split(",") if s.strip()]
 
 
+def _list_float(key: str, default: str = "") -> list[float]:
+    """Parse a comma-separated float environment variable into a list."""
+    raw = os.getenv(key, default).strip()
+    if not raw:
+        return []
+    try:
+        return [float(x.strip()) for x in raw.split(",") if x.strip()]
+    except ValueError:
+        return []
+
+
+# ─────────────────────────────────────────────
+# Binance API
+# ─────────────────────────────────────────────
+BINANCE_API_KEY: str = os.getenv("BINANCE_API_KEY", "")
+BINANCE_API_SECRET: str = os.getenv("BINANCE_API_SECRET", "")
+BINANCE_ENV: str = os.getenv("BINANCE_ENV", "prod")
+BINANCE_WS_URL: str = os.getenv("BINANCE_WS_URL", "wss://fstream.binance.com")
+
+# ─────────────────────────────────────────────
+# Telegram
+# ─────────────────────────────────────────────
+TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
+
+TELEGRAM_SEND_MESSAGE_URL: str = (
+    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    if TELEGRAM_BOT_TOKEN else ""
+)
+TELEGRAM_SEND_PHOTO_URL: str = (
+    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    if TELEGRAM_BOT_TOKEN else ""
+)
+
+# ─────────────────────────────────────────────
+# Trading Universe
+# ─────────────────────────────────────────────
+SYMBOLS: list[str] = _list_str("SYMBOLS")
+TIMEFRAMES: list[str] = (
+    [tf.strip() for tf in os.getenv("TIMEFRAMES", "1h").split(",") if tf.strip()]
+    or ["1h"]
+)
+
+MAX_SYMBOLS: int = _int("MAX_SYMBOLS", 0)
+SYMBOL_SELECTION_STRATEGY: str = os.getenv("SYMBOL_SELECTION_STRATEGY", "quality").lower()
+MIN_DAILY_VOLUME_USDT: float = _float("MIN_DAILY_VOLUME_USDT", 1_000_000.0)
+MIN_MARKET_CAP_USD: float = _float("MIN_MARKET_CAP_USD", 0.0)
+FILTER_BY_MARKET_CAP: bool = _bool("FILTER_BY_MARKET_CAP", 0)
+
+MAX_LEVERAGE: int = _int("MAX_LEVERAGE", 20)
+
+# ─────────────────────────────────────────────
+# TP / SL — ATR-based (primary) & fallback
+# ─────────────────────────────────────────────
+DEFAULT_SL_PERCENT: float = _float("DEFAULT_SL_PERCENT", 0.015)
+DEFAULT_TP_PERCENTS: list[float] = _list_float("DEFAULT_TP_PERCENTS", "0.01,0.025,0.04,0.06")
+
+LEVERAGE_BASED_TP_SL_ENABLED: bool = _bool("LEVERAGE_BASED_TP_SL_ENABLED", 0)
+LEVERAGE_BASE_RISK_PERCENT: float = _float("LEVERAGE_BASE_RISK_PERCENT", 2.0)
+LEVERAGE_BASE_TP_PERCENT: float = _float("LEVERAGE_BASE_TP_PERCENT", 1.0)
+LEVERAGE_MIN_SL_DISTANCE: float = _float("LEVERAGE_MIN_SL_DISTANCE", 0.1)
+LEVERAGE_MAX_SL_DISTANCE: float = _float("LEVERAGE_MAX_SL_DISTANCE", 5.0)
+LEVERAGE_MIN_TP_DISTANCE: float = _float("LEVERAGE_MIN_TP_DISTANCE", 0.2)
+LEVERAGE_MAX_TP_DISTANCE: float = _float("LEVERAGE_MAX_TP_DISTANCE", 3.0)
+
+# ─────────────────────────────────────────────
+# Signal Engine
+# ─────────────────────────────────────────────
+HISTORY_CANDLES: int = _int("HISTORY_CANDLES", 200)
+SIGNAL_COOLDOWN: int = _int("SIGNAL_COOLDOWN", 600)
+MIN_CONFLUENCE_SCORE: int = _int("MIN_CONFLUENCE_SCORE", 4)
+
+# ─────────────────────────────────────────────
+# Operating Modes
+# ─────────────────────────────────────────────
+SIMULATION_MODE: bool = _bool("SIMULATION_MODE", 0)
+DATA_TESTING: bool = _bool("DATA_TESTING", 0)
+DISABLE_CHARTING: bool = _bool("DISABLE_CHARTING", 0)
+
+# ─────────────────────────────────────────────
+# Historical / Lazy Loading
+# ─────────────────────────────────────────────
+LAZY_LOADING_ENABLED: bool = _bool("LAZY_LOADING_ENABLED", 1)
+MAX_LAZY_LOAD_SYMBOLS: int = _int("MAX_LAZY_LOAD_SYMBOLS", 20)
+MAX_CONCURRENT_LOADS: int = _int("MAX_CONCURRENT_LOADS", 5)
+
+# ─────────────────────────────────────────────
+# Database
+# ─────────────────────────────────────────────
+DB_PATH: str = os.getenv("DB_PATH", "trading_bot.db")
+DB_POOL_SIZE: int = _int("DB_POOL_SIZE", 10)
+DB_ENABLE_PERSISTENCE: bool = _bool("DB_ENABLE_PERSISTENCE", 1)
+DB_CLEANUP_DAYS: int = _int("DB_CLEANUP_DAYS", 7)
+DB_MAX_SIZE_MB: float = _float("DB_MAX_SIZE_MB", 200.0)
+DB_MAX_RECORDS: int = _int("DB_MAX_RECORDS", 1_000_000)
+DB_AUTO_CLEANUP_ENABLED: bool = _bool("DB_AUTO_CLEANUP_ENABLED", 1)
+DB_CLEANUP_INTERVAL_HOURS: int = _int("DB_CLEANUP_INTERVAL_HOURS", 6)
+
+# ─────────────────────────────────────────────
+# Rate Limiting
+# ─────────────────────────────────────────────
+RATE_LIMITING_ENABLED: bool = _bool("RATE_LIMITING_ENABLED", 1)
+RATE_LIMIT_SAFETY_MARGIN: float = _float("RATE_LIMIT_SAFETY_MARGIN", 0.1)
+RATE_LIMIT_WARNING_THRESHOLD: float = _float("RATE_LIMIT_WARNING_THRESHOLD", 0.8)
+RATE_LIMIT_MAX_WEIGHT_PER_MINUTE: int = _int("RATE_LIMIT_MAX_WEIGHT_PER_MINUTE", 1200)
+RATE_LIMIT_MAX_REQUESTS_PER_MINUTE: int = _int("RATE_LIMIT_MAX_REQUESTS_PER_MINUTE", 1200)
+RATE_LIMIT_RETRY_DELAY: float = _float("RATE_LIMIT_RETRY_DELAY", 1.0)
+RATE_LIMIT_MAX_RETRIES: int = _int("RATE_LIMIT_MAX_RETRIES", 3)
+RATE_LIMIT_DETAILED_LOGGING: bool = _bool("RATE_LIMIT_DETAILED_LOGGING", 0)
+RATE_LIMIT_LOG_INTERVAL: int = _int("RATE_LIMIT_LOG_INTERVAL", 60)
