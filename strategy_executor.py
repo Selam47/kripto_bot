@@ -20,11 +20,12 @@ class StrategyExecutor:
         self.charting_service = charting_service
         self.risk_manager = risk_manager
         self.db = get_database() if config.DB_ENABLE_PERSISTENCE else None
-        # max_workers=1 → tek thread, aynı sinyal 3 kez gitmez
         self.signal_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="SignalProcessor")
         self.processing_lock = threading.Lock()
-        # Gönderilmiş sinyalleri takip et — aynı sinyal tekrar gitmesin
+        # Gönderilmiş sinyalleri takip et
         self.sent_signals = {}
+        # Saatlik zorunlu analiz için son gönderim zamanı
+        self.last_hourly_update = {}
 
     def handle_kline(self, k):
         if not self._validate_kline_input(k):
@@ -54,21 +55,13 @@ class StrategyExecutor:
                 chart_path = callback_data.chart_path
                 if chart_path and not self._validate_chart_file(chart_path):
                     chart_path = None
-
             notif_data = SignalNotificationData(
-                symbol=callback_data.symbol,
-                interval=callback_data.interval,
-                entry_prices=callback_data.entry_prices,
-                tp_list=callback_data.tp_list,
-                sl=callback_data.sl,
-                chart_path=chart_path,
-                signal_info=callback_data.signal_info,
-                leverage=callback_data.leverage,
-                margin_type=callback_data.margin_type,
-                risk_guidance=None
+                symbol=callback_data.symbol, interval=callback_data.interval,
+                entry_prices=callback_data.entry_prices, tp_list=callback_data.tp_list,
+                sl=callback_data.sl, chart_path=chart_path, signal_info=callback_data.signal_info,
+                leverage=callback_data.leverage, margin_type=callback_data.margin_type, risk_guidance=None
             )
             self._send_signal_notif(notif_data)
-
             with self.processing_lock:
                 self.signal_cooldown[(callback_data.symbol, callback_data.interval)] = time.time()
         finally:
@@ -93,22 +86,20 @@ class StrategyExecutor:
         except Exception as e:
             logging.error(f"Error in async signal processing for {symbol}-{interval}: {e}")
 
-    def _is_on_cooldown(self, key, current_time, cooldown_seconds):
-        """Cooldown kontrolü ve işaretleme — atomik olarak yapılır."""
+    def _check_cooldown(self, key, current_time, cooldown_seconds):
+        """Sadece kontrol eder, işaretlemez."""
         with self.processing_lock:
             if self.db:
                 last_signal_time_db = self.db.get_last_signal_time(key[0], key[1])
-                last_signal_timestamp = last_signal_time_db.timestamp() if last_signal_time_db else 0
+                last_ts = last_signal_time_db.timestamp() if last_signal_time_db else 0
             else:
-                last_signal_timestamp = self.signal_cooldown.get(key, 0)
+                last_ts = self.signal_cooldown.get(key, 0)
+            return (current_time - last_ts) < cooldown_seconds
 
-            time_diff = current_time - last_signal_timestamp
-            if time_diff < cooldown_seconds:
-                return True  # Cooldown'da, geç
-
-            # Cooldown'da değil — hemen işaretle ki başka thread gelmesin
+    def _mark_cooldown(self, key, current_time):
+        """Sinyal gönderildikten sonra cooldown'ı işaretle."""
+        with self.processing_lock:
             self.signal_cooldown[key] = current_time
-            return False
 
     def process_signals(self, symbol, interval, df):
         min_candles_needed = 20 if config.SIMULATION_MODE or config.DATA_TESTING else 50
@@ -131,29 +122,32 @@ class StrategyExecutor:
         else:
             cooldown_seconds = timeframe_to_seconds(interval)
 
-        # Atomik cooldown kontrolü
-        if self._is_on_cooldown(key, current_time, cooldown_seconds):
+        # Cooldown kontrolü — işaretleme YOK henüz
+        if self._check_cooldown(key, current_time, cooldown_seconds):
+            # Cooldown'dayken bile saatlik özet at
+            self._maybe_send_hourly_update(symbol, interval, df, current_time)
             return
 
         if not self._check_higher_timeframe_trend(symbol, interval):
             return
 
         signal_info = check_signal(df)
+
         if not signal_info:
+            # Sinyal yok — saatlik özet at
+            self._maybe_send_hourly_update(symbol, interval, df, current_time)
             return
 
         try:
             last_price = float(df["close"].iloc[-1])
         except (IndexError, ValueError, TypeError):
-            logging.warning(f"Error getting last price for {symbol}-{interval}")
             return
 
-        # Aynı fiyatta aynı sinyal tekrar gitmesin
-        signal_key = f"{symbol}-{interval}-{signal_info}-{last_price:.2f}"
+        # Duplicate kontrol
+        signal_key = f"{symbol}-{interval}-{signal_info}-{round(last_price, 1)}"
         with self.processing_lock:
             last_sent = self.sent_signals.get(signal_key, 0)
             if current_time - last_sent < cooldown_seconds:
-                logging.debug(f"Duplicate signal blocked: {signal_key}")
                 return
             self.sent_signals[signal_key] = current_time
 
@@ -164,20 +158,19 @@ class StrategyExecutor:
         if not entry_prices:
             return
 
+        # Cooldown'ı şimdi işaretle (sinyal var, gönderilecek)
+        self._mark_cooldown(key, current_time)
+
         if self.charting_service:
             try:
                 clean_df = self.trade_manager.get_clean_kline_data_for_chart(symbol, interval)
                 if len(clean_df) < min_candles_needed:
                     del clean_df
-                    self._send_without_chart(symbol, interval, entry_prices, tp_list, sl, signal_info, max_leverage, margin_type, key, current_time)
+                    self._send_without_chart(symbol, interval, entry_prices, tp_list, sl, signal_info, max_leverage, margin_type)
                     return
-
                 chart_data = ChartData(
-                    ohlc_df=clean_df,
-                    symbol=symbol,
-                    timeframe=interval,
-                    tp_levels=tp_list,
-                    sl_level=sl,
+                    ohlc_df=clean_df, symbol=symbol, timeframe=interval,
+                    tp_levels=tp_list, sl_level=sl,
                     callback=lambda path, error: self.handle_chart_callback(
                         ChartCallbackData(
                             chart_path=path, error=error, symbol=symbol, interval=interval,
@@ -189,20 +182,60 @@ class StrategyExecutor:
                 self.charting_service.submit_plot_chart_task(chart_data)
                 del clean_df
             except Exception as e:
-                logging.error(f"Chart error for {symbol}-{interval}: {e}")
-                self._send_without_chart(symbol, interval, entry_prices, tp_list, sl, signal_info, max_leverage, margin_type, key, current_time)
+                logging.error(f"Chart error: {e}")
+                self._send_without_chart(symbol, interval, entry_prices, tp_list, sl, signal_info, max_leverage, margin_type)
         else:
-            self._send_without_chart(symbol, interval, entry_prices, tp_list, sl, signal_info, max_leverage, margin_type, key, current_time)
+            self._send_without_chart(symbol, interval, entry_prices, tp_list, sl, signal_info, max_leverage, margin_type)
 
-    def _send_without_chart(self, symbol, interval, entry_prices, tp_list, sl, signal_info, max_leverage, margin_type, key, current_time):
+    def _maybe_send_hourly_update(self, symbol, interval, df, current_time):
+        """Sinyal yoksa bile saatte bir durum özeti gönder."""
+        hourly_key = f"{symbol}-{interval}"
+        with self.processing_lock:
+            last_sent = self.last_hourly_update.get(hourly_key, 0)
+            if current_time - last_sent < 3600:  # 1 saat
+                return
+            self.last_hourly_update[hourly_key] = current_time
+
+        try:
+            last_price = float(df["close"].iloc[-1])
+
+            from strategy import compute_rsi, compute_ema
+            rsi_series = compute_rsi(df["close"], 14)
+            rsi = float(rsi_series.iloc[-1]) if not rsi_series.empty else 0
+            ema50 = float(compute_ema(df["close"], 50).iloc[-1])
+
+            trend = "YUKARI" if last_price > ema50 else "ASAGI"
+            rsi_durum = "ASIRI ALIM" if rsi > 70 else ("ASIRI SATIM" if rsi < 30 else "NORMAL")
+
+            tf_label = {
+                "1h": "Orta Vadeli", "4h": "Uzun Vadeli",
+                "15m": "Kisa Vadeli", "5m": "Scalp"
+            }.get(interval, interval)
+
+            msg = (
+                f"📊 SAATLIK ANALIZ | {symbol.upper()}\n"
+                f"{'─' * 30}\n"
+                f"Zaman: {tf_label}\n"
+                f"Fiyat: {last_price:.2f}\n"
+                f"Trend: {trend}\n"
+                f"RSI: {rsi:.1f} ({rsi_durum})\n"
+                f"EMA50: {ema50:.2f}\n"
+                f"{'─' * 30}\n"
+                f"⏳ Sinyal koşulu henüz oluşmadı\n"
+                f"Bu bir finansal tavsiye degildir."
+            )
+            send_message_with_retry(msg)
+            logging.info(f"📊 Saatlik özet gönderildi: {symbol}-{interval}")
+        except Exception as e:
+            logging.error(f"Saatlik özet hatası {symbol}-{interval}: {e}")
+
+    def _send_without_chart(self, symbol, interval, entry_prices, tp_list, sl, signal_info, max_leverage, margin_type):
         notif_data = SignalNotificationData(
             symbol=symbol, interval=interval, entry_prices=entry_prices,
             tp_list=tp_list, sl=sl, chart_path=None, signal_info=signal_info,
             leverage=max_leverage, margin_type=margin_type, risk_guidance=None
         )
         self._send_signal_notif(notif_data)
-        with self.processing_lock:
-            self.signal_cooldown[key] = current_time
 
     def _check_higher_timeframe_trend(self, symbol, interval):
         higher_timeframes = {'15m': '1h', '30m': '4h', '1h': '4h', '4h': '1d'}
@@ -223,7 +256,7 @@ class StrategyExecutor:
                 tp_list, sl, risk_info = self.risk_manager.calculate_leverage_based_tp_sl(symbol, last_price, signal_info)
                 return [last_price], tp_list, sl, risk_info
             except Exception as e:
-                logging.error(f"Leverage-based TP/SL error for {symbol}: {e}")
+                logging.error(f"Leverage-based TP/SL error: {e}")
 
         sl_percent = config.DEFAULT_SL_PERCENT
         tp_percents = config.DEFAULT_TP_PERCENTS
@@ -274,8 +307,7 @@ class StrategyExecutor:
                     last_price = float(df['close'].iloc[-1])
                     entry_prices, tp_list, sl, _ = self._generate_trade_parameters(test_signal, last_price, df, symbol)
                     if entry_prices:
-                        key = (symbol, interval)
-                        self._send_without_chart(symbol, interval, entry_prices, tp_list, sl, test_signal, 20, "ISOLATED", key, time.time())
+                        self._send_without_chart(symbol, interval, entry_prices, tp_list, sl, test_signal, 20, "ISOLATED")
                     time.sleep(1)
                 except Exception as e:
                     logging.error(f"Test modu hatası {symbol} {interval}: {e}")
