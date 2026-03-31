@@ -1,0 +1,131 @@
+import logging
+from datetime import datetime, timezone
+
+import numpy as np
+import pandas as pd
+
+from config import BINANCE_ENV, TIMEFRAMES
+
+symbol_separator = "&" if BINANCE_ENV == "dev" else "/" # for dev, we can hit testnet.binance.vision, and usually the separator is different from the prod
+
+
+def now_utc() -> datetime:
+    """
+    Get current UTC datetime.
+    """
+    return datetime.now(timezone.utc)
+
+
+def now_utc_timestamp() -> float:
+    """
+    Get current UTC timestamp (Unix seconds).
+    """
+    return now_utc().timestamp()
+
+
+def now_utc_strftime(format_str: str = "%Y%m%d-%H%M%S") -> str:
+    """
+    Get current UTC datetime formatted as string.
+    
+    Args:
+        format_str (str): Format string for datetime
+    """
+    return now_utc().strftime(format_str)
+
+
+def timeframe_to_seconds(timeframe: str) -> int:
+    """
+    Convert timeframe string to seconds.
+    
+    Args:
+        timeframe (str): Timeframe like '15m', '30m', '1h', '4h', '1d'
+        
+    Returns:
+        int: Duration in seconds
+        
+    Examples:
+        timeframe_to_seconds('15m') -> 900
+        timeframe_to_seconds('1h') -> 3600
+        timeframe_to_seconds('4h') -> 14400
+    """
+    timeframe = timeframe.lower().strip()
+    
+    # Extract number and unit
+    if timeframe.endswith('m'):
+        minutes = int(timeframe[:-1])
+        return minutes * 60
+    elif timeframe.endswith('h'):
+        hours = int(timeframe[:-1])
+        return hours * 3600
+    elif timeframe.endswith('d'):
+        days = int(timeframe[:-1])
+        return days * 86400
+    elif timeframe.endswith('w'):
+        weeks = int(timeframe[:-1])
+        return weeks * 604800
+    else:
+        # Fallback: assume it's minutes if no unit
+        try:
+            return int(timeframe) * 60
+        except ValueError:
+            logging.warning(f"Unknown timeframe format: {timeframe}, defaulting to 15 minutes")
+            return 900  # Default to 15 minutes
+
+
+def pd_now_utc() -> pd.Timestamp:
+    """
+    Get current UTC timestamp as pandas Timestamp.
+    """
+    return pd.Timestamp.now(tz='UTC')
+
+
+def build_streams(symbols):
+    """Create URL stream multiple symbols & interval"""
+    streams = []
+    for sym in symbols:
+        for tf in TIMEFRAMES:
+            streams.append(f"{sym.lower()}@kline_{tf}")
+    return symbol_separator.join(streams)
+
+
+
+def create_realistic_test_data(periods=200, base_price=30000):
+    np.random.seed(42)
+    dates = pd.date_range(end=pd_now_utc(), periods=periods, freq="15min")
+
+    # Create price movement with trend and noise
+    trend = np.linspace(0, 0.02, periods)
+    noise = np.cumsum(np.random.normal(0, 0.001, periods))
+    price_multiplier = 1 + trend + noise
+    close_prices = base_price * price_multiplier
+
+    # Create DataFrame with proper OHLC structure
+    df = pd.DataFrame(index=dates)
+    df['close'] = close_prices
+    df['open'] = df['close'].shift(1).fillna(close_prices[0] * 0.999)
+
+    # Initialize high and low columns with base values
+    df['high'] = df[['open', 'close']].max(axis=1)
+    df['low'] = df[['open', 'close']].min(axis=1)
+
+    # Add realistic volatility to high/low
+    volatility = np.random.uniform(0.001, 0.003, len(df))
+
+    # Bullish candles
+    bullish_mask = df['close'] > df['open']
+    df.loc[bullish_mask, 'high'] = df.loc[bullish_mask, 'close'] * (1 + volatility[bullish_mask])
+    df.loc[bullish_mask, 'low'] = df.loc[bullish_mask, 'open'] * (1 - volatility[bullish_mask] * 0.5)
+
+    # Bearish candles
+    bearish_mask = ~bullish_mask
+    df.loc[bearish_mask, 'high'] = df.loc[bearish_mask, 'open'] * (1 + volatility[bearish_mask])
+    df.loc[bearish_mask, 'low'] = df.loc[bearish_mask, 'close'] * (1 - volatility[bearish_mask] * 0.5)
+
+    # Ensure OHLC relationships are correct
+    df['high'] = df[['high', 'open', 'close']].max(axis=1)
+    df['low'] = df[['low', 'open', 'close']].min(axis=1)
+
+    # Add volume data
+    df['volume'] = np.random.lognormal(10, 1, len(df))
+
+    return df

@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TradingView Lightweight Chart</title>
+    <!-- Custom CSS for styling the chart container and its elements -->
+    <style>
+        body {{
+            background-color: #F9FAFB;
+            font-family: sans-serif;
+            color: #1F2937;
+            padding: 32px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+        }}
+
+        .container {{
+            width: 100%;
+            max-width: {width}px;
+            text-align: center;
+            border: 1px solid #E5E7EB;
+            border-radius: 12px;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+            padding: 1.5rem;
+            padding-bottom: 2.5rem;  /* Extra bottom padding for TradingView logo */
+            background-color: #ffffff;
+        }}
+
+        #chart {{
+            width: 100%;
+            height: {height}px;
+            position: relative;
+        }}
+
+        .chart-overlay {{
+            position: absolute;
+            bottom: 15px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(255, 255, 255, 0.85);
+            padding: 6px 12px;
+            border-radius: 4px;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            color: #1f2937;
+            z-index: 1000;
+            pointer-events: none;
+            text-align: center;
+            line-height: 1.4;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+        }}
+
+        .chart-date {{
+            font-size: 0.75rem;
+            font-weight: 400;
+            color: #6b7280;
+            margin-bottom: 2px;
+        }}
+
+        .chart-symbol-time {{
+            font-size: 0.9rem;
+            font-weight: 600;
+            color: #1f2937;
+        }}
+
+    </style>
+</head>
+<body>
+    <!-- The new container for the chart, as you requested -->
+    <div class="container">
+        <div id="chart">
+            <!-- Professional chart overlay like TradingView -->
+            <div class="chart-overlay">
+                <div class="chart-date" id="chart-date">Loading...</div>
+                <div class="chart-symbol-time" id="chart-symbol-time">Loading...</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Lightweight Charts library from TradingView -->
+    <script src="https://cdn.jsdelivr.net/npm/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+
+    <script>
+        // Use an immediately invoked function to encapsulate the script
+        (function() {{
+            // Provided data
+            const chartData = {ohlc_json}
+            // Sample data for MA, RSI, TP, and SL since we don't have a backend
+            const maData =  {ma_json}
+            const rsiData = {rsi_json}
+            const tpLevels = {tp_json};
+            const slLevel = {sl_json};
+
+            window.aData = {{chartData, maData, rsiData, tpLevels,slLevel}}
+
+            // Get the container element and define the chart
+            const container = document.getElementById('chart');
+            const chart = LightweightCharts.createChart(container, {{
+                width: container.offsetWidth,
+                height: container.offsetHeight,
+                layout: {{
+                    background: {{ color: '#ffffff' }},
+                    textColor: '#1F2937',
+                    // Official TradingView attribution logo
+                    attributionLogo: true,
+                }},
+                grid: {{
+                    vertLines: {{ color: '#E5E7EB' }},
+                    horzLines: {{ color: '#E5E7EB' }},
+                }},
+                // Define the main price scale with automatic fitting
+                rightPriceScale: {{
+                    borderColor: '#D1D5DB',
+                    visible: true,
+                    autoScale: true,           // Enable automatic price scaling
+                    scaleMargins: {{           // Add margins for better visibility
+                        top: 0.1,              // 10% margin at top
+                        bottom: 0.1,           // 10% margin at bottom
+                    }},
+                }},
+                
+                leftPriceScale: {{
+                    visible: false,
+                }},
+                timeScale: {{
+                    borderColor: '#D1D5DB',
+                    timeVisible: true,     // Show time labels
+                    secondsVisible: false, // Hide seconds for cleaner look
+                    visible: true,         // Show time scale
+                    // Remove custom formatter to use default spacing and localization
+                }},
+                // Enable interactions for better rendering
+                handleScroll: true,
+                handleScale: true,
+            }});
+
+            // Add the candlestick series to the chart with better visibility
+            const candlestickSeries = chart.addSeries(LightweightCharts.CandlestickSeries, {{
+                upColor: '#22c55e',           // Green for bullish candles
+                downColor: '#ef4444',         // Red for bearish candles  
+                borderVisible: true,          // Show borders for better definition
+                borderUpColor: '#22c55e',     // Green borders for bullish
+                borderDownColor: '#ef4444',   // Red borders for bearish
+                wickUpColor: '#22c55e',       // Green wicks for bullish
+                wickDownColor: '#ef4444',     // Red wicks for bearish
+                priceScaleId: 'right',        // Use right price scale
+            }});
+            candlestickSeries.setData(chartData);
+
+            // MA line removed for cleaner chart appearance
+            // (MA data still calculated for signal logic but not displayed)
+
+            // RSI line removed for cleaner chart appearance
+            // (RSI data still calculated for signal logic but not displayed)
+
+            // Add TP/SL Lines (simplified approach for better visibility)
+            if (chartData.length > 0) {{
+                // TP colors with 60% transparency
+                const colors = ['rgba(76, 175, 80, 0.4)', 'rgba(139, 195, 74, 0.4)', 'rgba(205, 220, 57, 0.4)', 'rgba(255, 235, 59, 0.4)'];
+                const startTime = chartData[0].time;
+                const endTime = chartData[chartData.length - 1].time;
+
+                // Add TP levels as full-width horizontal lines (TP1, TP2, TP3, TP4)
+                if (tpLevels && tpLevels.length > 0) {{
+                    tpLevels.forEach((level, i) => {{
+                        const tpSeries = chart.addSeries(LightweightCharts.LineSeries, {{
+                            color: colors[i % colors.length],
+                            lineWidth: 8,
+                            lineStyle: LightweightCharts.LineStyle.Solid,
+                            title: `TP${{i + 1}}`,  // TP1, TP2, TP3, TP4 (standard convention)
+                            priceScaleId: 'right'
+                        }});
+                        tpSeries.setData([
+                            {{ time: startTime, value: level }},
+                            {{ time: endTime, value: level }}
+                        ]);
+                    }});
+                }}
+
+                // Add SL level as full-width horizontal line
+                if (slLevel !== null) {{
+                    const slSeries = chart.addSeries(LightweightCharts.LineSeries, {{
+                        color: 'rgba(244, 67, 54, 0.4)',
+                        lineWidth: 8,
+                        lineStyle: LightweightCharts.LineStyle.Solid,
+                        title: 'SL',
+                        priceScaleId: 'right'
+                    }});
+                    slSeries.setData([
+                        {{ time: startTime, value: slLevel }},
+                        {{ time: endTime, value: slLevel }}
+                    ]);
+                }}
+            }}
+
+            // Update chart overlay with dynamic information
+            function updateChartOverlay() {{
+                const dateElement = document.getElementById('chart-date');
+                const symbolTimeElement = document.getElementById('chart-symbol-time');
+                
+                if (dateElement && symbolTimeElement && chartData.length > 0) {{
+                    // Get current date in user's locale format
+                    const currentDate = new Date();
+                    const dateOptions = {{
+                        year: 'numeric',
+                        month: 'numeric',
+                        day: 'numeric'
+                    }};
+                    const dateString = currentDate.toLocaleDateString(navigator.language, dateOptions);
+                    
+                    // Extract symbol and timeframe from symbol string (e.g., "BTCUSDT-30m")
+                    const symbolParts = '{symbol}'.split('-');
+                    const symbolName = symbolParts[0] || 'SYMBOL';
+                    const timeframe = symbolParts.length > 1 ? symbolParts[1].toUpperCase() : '30M';
+                    
+                    // Set multi-line format with localized date
+                    dateElement.textContent = dateString;
+                    symbolTimeElement.textContent = `${{symbolName}} | ${{timeframe}}`;
+                }}
+            }}
+
+            // Automatically fit the content and scale properly
+            chart.timeScale().fitContent();
+            
+            // Ensure proper price scaling after data is loaded
+            setTimeout(() => {{
+                chart.priceScale('right').applyOptions({{
+                    autoScale: true,
+                    scaleMargins: {{
+                        top: 0.1,
+                        bottom: 0.1,
+                    }},
+                }});
+                chart.timeScale().fitContent();
+            }}, 100);
+            
+            // Update overlay information
+            updateChartOverlay();
+            
+            window.chartReady = true; //This is important to signal playwright that chart actually already drawn
+        }})();
+    </script>
+</body>
+</html>
