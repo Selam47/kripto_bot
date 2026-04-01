@@ -1,35 +1,3 @@
-"""
-TradingEngine — Signal Orchestrator
-======================================
-The central signal-processing pipeline.  Every live kline update flows through
-this class:
-
-    WebSocket kline → validate → update MarketData
-                                     ↓
-                          lazy-load history (if needed)
-                                     ↓
-                          cooldown / duplicate guard
-                                     ↓
-                        MTF Trend Guard validation
-                                     ↓
-                       ConfluenceEngine.analyze(df)
-                                     ↓
-                    ConfluenceEngine.calculate_atr_levels()
-                                     ↓
-              DB persistence → chart request → NotificationManager
-
-Design
-------
-- A 2-worker ``ThreadPoolExecutor`` (``SignalWorker-0/1``) handles per-symbol
-  signal processing in parallel without blocking the WebSocket receive thread.
-- All shared state (cooldowns, sent-signal cache) is protected by a single
-  ``threading.Lock``.
-- Signal deduplication: the same direction at the same price within one
-  cooldown window is suppressed.
-- Sent-signal cache is pruned every ``SENT_SIGNALS_CLEANUP_INTERVAL`` seconds
-  to prevent unbounded memory growth.
-"""
-
 import logging
 import os
 import threading
@@ -48,25 +16,77 @@ from util import now_utc, timeframe_to_seconds
 
 logger = logging.getLogger(__name__)
 
-_SENT_MAX_AGE: int = 28800
-_SENT_CLEANUP_INTERVAL: int = 600
+
+class SignalTracker:
+    """
+    In-memory deduplication cache keyed on (Symbol, Direction, Candle_Open_Time).
+
+    Guarantees exactly one notification per unique candle/direction combination
+    regardless of how many kline updates arrive for the same bar.  Stale
+    entries are pruned periodically to keep memory usage flat.
+    """
+
+    def __init__(
+        self,
+        max_age_seconds: int = 28800,
+        cleanup_interval_seconds: int = 600,
+    ):
+        self._seen: dict[str, float] = {}
+        self._lock = threading.Lock()
+        self._max_age = max_age_seconds
+        self._cleanup_interval = cleanup_interval_seconds
+        self._last_cleanup: float = time.monotonic()
+
+    def is_duplicate(self, symbol: str, direction: str, candle_open_time: int) -> bool:
+        """
+        Return True if this (symbol, direction, candle) combination was already
+        sent, and record it as sent if not.
+
+        This check-and-set is atomic under the lock so concurrent workers cannot
+        both clear the same key simultaneously.
+        """
+        key = f"{symbol}-{direction}-{candle_open_time}"
+        with self._lock:
+            if key in self._seen:
+                return True
+            self._seen[key] = time.time()
+            return False
+
+    def prune(self):
+        """Remove entries older than max_age_seconds. Called after each signal."""
+        now_mono = time.monotonic()
+        if now_mono - self._last_cleanup < self._cleanup_interval:
+            return
+        self._last_cleanup = now_mono
+        wall_now = time.time()
+        with self._lock:
+            expired = [
+                k for k, ts in self._seen.items()
+                if wall_now - ts > self._max_age
+            ]
+            for k in expired:
+                del self._seen[k]
+            if expired:
+                logger.debug(f"SignalTracker pruned {len(expired)} stale entries")
 
 
 class TradingEngine:
     """
-    Signal orchestrator that connects live market data to the analysis engine
-    and the notification pipeline.
+    Signal orchestrator: WebSocket kline → analysis pipeline → Telegram.
 
-    Attributes
-    ----------
-    market_data : MarketData
-        Singleton OHLCV store.
-    notifier : NotificationManager
-        Singleton async Telegram gateway.
-    risk_manager : RiskManager | None
-        Optional risk manager for leverage-based TP/SL fallback.
-    charting_service : ChartingService | None
-        Optional async chart generator.
+    Processing order per kline event
+    ---------------------------------
+    1.  validate kline structure
+    2.  update MarketData store
+    3.  submit to SignalWorker thread pool (non-blocking)
+    4.  lazy-load history if insufficient bars
+    5.  per-symbol cooldown gate  (config.SIGNAL_COOLDOWN seconds)
+    6.  ConfluenceEngine.analyze()
+    7.  MTFTrendGuard validation
+    8.  SignalTracker deduplication  (symbol + direction + candle open time)
+    9.  ATR TP/SL calculation
+    10. DB persistence
+    11. NotificationManager dispatch (with or without chart)
     """
 
     def __init__(
@@ -76,17 +96,6 @@ class TradingEngine:
         risk_manager=None,
         charting_service=None,
     ):
-        """
-        Initialise the trading engine.
-
-        Args:
-            market_data:       Singleton ``MarketData`` instance.
-            notification_mgr:  Singleton ``NotificationManager`` instance.
-            risk_manager:      Optional ``RiskManager`` for leverage-based
-                               TP/SL calculations.
-            charting_service:  Optional ``ChartingService`` for PNG chart
-                               generation.
-        """
         self.market_data = market_data
         self.notifier = notification_mgr
         self.risk_manager = risk_manager
@@ -98,20 +107,15 @@ class TradingEngine:
         )
         self._lock = threading.Lock()
         self._cooldowns: dict[tuple[str, str], float] = {}
-        self._sent_signals: dict[str, float] = {}
-        self._last_cleanup: float = time.monotonic()
+        self._signal_tracker = SignalTracker(
+            max_age_seconds=max(config.SIGNAL_COOLDOWN * 2, 28800),
+            cleanup_interval_seconds=600,
+        )
 
     def handle_kline(self, k: dict):
         """
-        Entry-point for a raw kline message from the Binance WebSocket.
-
-        Validates the kline dict structure, updates the in-memory price store,
-        and submits signal processing to the thread pool — all without blocking
-        the WebSocket receive thread.
-
-        Args:
-            k: Raw kline dict with keys ``s``, ``i``, ``t``, ``o``, ``h``,
-               ``l``, ``c``, ``v``.
+        Entry-point for a raw kline dict from the Binance WebSocket.
+        Non-blocking — submits work to the thread pool immediately.
         """
         if not self._validate_kline(k):
             return
@@ -120,15 +124,6 @@ class TradingEngine:
 
     @staticmethod
     def _validate_kline(k) -> bool:
-        """
-        Validate that a kline dict contains all required numeric fields.
-
-        Args:
-            k: Object to validate.
-
-        Returns:
-            ``True`` when the kline is well-formed.
-        """
         if not isinstance(k, dict):
             return False
         for field in ("s", "i", "o", "h", "l", "c", "v", "t"):
@@ -142,17 +137,7 @@ class TradingEngine:
         return True
 
     def _process(self, symbol: str, interval: str, candle_open_time: int):
-        """
-        Worker-thread entry-point for signal processing.
-
-        Wraps ``_run_pipeline`` in a top-level exception handler so a crash in
-        one symbol never affects others.
-
-        Args:
-            symbol:           Trading pair.
-            interval:         Timeframe string.
-            candle_open_time: Kline open timestamp in milliseconds (``k["t"]``).
-        """
+        """Worker-thread wrapper — catches all exceptions so one symbol never kills others."""
         try:
             self._run_pipeline(symbol, interval, candle_open_time)
         except Exception as e:
@@ -162,27 +147,7 @@ class TradingEngine:
             )
 
     def _run_pipeline(self, symbol: str, interval: str, candle_open_time: int):
-        """
-        Full signal pipeline for one symbol/interval pair.
-
-        Steps
-        -----
-        1. Ensure sufficient historical data (lazy-load if needed).
-        2. Check cooldown — skip if a signal was recently emitted.
-        3. Run MTF Trend Guard — block counter-trend trades.
-        4. Run ConfluenceEngine — generate signal or exit.
-        5. Deduplicate against sent-signal cache (keyed on candle open time).
-        6. Compute ATR-based TP/SL levels.
-        7. Persist signal to database.
-        8. Dispatch to NotificationManager (with or without chart).
-
-        Args:
-            symbol:           Trading pair.
-            interval:         Timeframe string.
-            candle_open_time: Kline open timestamp in milliseconds — used as
-                              the uniqueness key for signal deduplication so
-                              only one notification is fired per candle/direction.
-        """
+        """Full signal pipeline for one symbol/interval/candle."""
         min_candles = 20 if (config.SIMULATION_MODE or config.DATA_TESTING) else 50
 
         df = self.market_data.get_klines(symbol, interval)
@@ -195,13 +160,9 @@ class TradingEngine:
             return
 
         key = (symbol, interval)
-        now = time.monotonic()
         wall_now = time.time()
 
-        if config.DATA_TESTING:
-            cooldown = 0.0
-        else:
-            cooldown = float(config.SIGNAL_COOLDOWN)
+        cooldown = 0.0 if config.DATA_TESTING else float(config.SIGNAL_COOLDOWN)
 
         if self._is_on_cooldown(key, wall_now, cooldown):
             return
@@ -225,13 +186,13 @@ class TradingEngine:
             logger.warning(f"Could not read last price for {symbol}-{interval}")
             return
 
-        signal_key = f"{symbol}-{signal.direction}-{candle_open_time}"
-        with self._lock:
-            if signal_key in self._sent_signals:
-                return
-            self._sent_signals[signal_key] = wall_now
+        if self._signal_tracker.is_duplicate(symbol, signal.direction, candle_open_time):
+            logger.debug(
+                f"Duplicate suppressed: {symbol} {signal.direction} candle={candle_open_time}"
+            )
+            return
 
-        self._prune_sent_cache(now)
+        self._signal_tracker.prune()
 
         max_leverage = (
             self.risk_manager.get_max_leverage_for_symbol(symbol)
@@ -287,33 +248,9 @@ class TradingEngine:
         df,
         symbol: str,
     ) -> tuple:
-        """
-        Compute TP/SL levels with a three-tier fallback strategy.
-
-        Priority
-        --------
-        1. **ATR-based dynamic levels** (primary) — from ``ConfluenceEngine``.
-        2. **Leverage-based levels** — from ``RiskManager`` when enabled.
-        3. **Fixed percentage fallback** — from ``config.DEFAULT_*`` values.
-
-        Args:
-            signal:      ``SignalResult`` containing ATR and entry price.
-            last_price:  Latest close price.
-            df:          OHLCV DataFrame.
-            symbol:      Trading pair (for leverage lookup).
-
-        Returns:
-            Tuple of ``(entry_prices, tp_list, sl, position_bias)`` or
-            ``(None, None, None, None)`` on failure.
-        """
         try:
             levels = ConfluenceEngine.calculate_atr_levels(signal, df)
             if levels:
-                logger.debug(
-                    f"ATR levels: entry={levels.entry_prices[0]:.4f} "
-                    f"TP1={levels.tp_list[0]:.4f} SL={levels.sl:.4f} "
-                    f"R:R={levels.risk_reward_ratio}"
-                )
                 return levels.entry_prices, levels.tp_list, levels.sl, levels.position_bias
         except Exception as e:
             logger.error(f"ATR level calculation error: {e}")
@@ -349,21 +286,6 @@ class TradingEngine:
     def _is_on_cooldown(
         self, key: tuple[str, str], wall_now: float, cooldown: float
     ) -> bool:
-        """
-        Check whether the symbol/interval is within its signal cooldown window.
-
-        Checks the database first (for persistence across restarts), then falls
-        back to the in-memory cooldown dict.  Updates the cooldown timestamp on
-        first pass.
-
-        Args:
-            key:       ``(symbol, interval)`` tuple.
-            wall_now:  Current wall-clock time (``time.time()``).
-            cooldown:  Cooldown duration in seconds.
-
-        Returns:
-            ``True`` if still within cooldown and signal should be skipped.
-        """
         with self._lock:
             if self.db:
                 last_db = self.db.get_last_signal_time(key[0], key[1])
@@ -376,31 +298,6 @@ class TradingEngine:
 
             self._cooldowns[key] = wall_now
             return False
-
-    def _prune_sent_cache(self, mono_now: float):
-        """
-        Remove stale entries from the sent-signal deduplication cache.
-
-        Called after each new signal to keep memory usage bounded.  Uses
-        monotonic time for the interval check but wall-clock time for the entry
-        timestamps.
-
-        Args:
-            mono_now: Current monotonic time (``time.monotonic()``).
-        """
-        if mono_now - self._last_cleanup < _SENT_CLEANUP_INTERVAL:
-            return
-        wall_now = time.time()
-        with self._lock:
-            expired = [
-                k for k, t in self._sent_signals.items()
-                if wall_now - t > _SENT_MAX_AGE
-            ]
-            for k in expired:
-                del self._sent_signals[k]
-            if expired:
-                logger.debug(f"Pruned {len(expired)} stale sent-signal entries")
-        self._last_cleanup = mono_now
 
     def _dispatch_with_chart(
         self,
@@ -416,21 +313,6 @@ class TradingEngine:
         key: tuple,
         wall_now: float,
     ):
-        """
-        Submit a chart generation task and wire up the callback to send the
-        resulting image alongside the signal notification.
-
-        Falls back to a text-only notification if the chart data is insufficient
-        or if chart generation fails.
-
-        Args:
-            symbol, interval, entry_prices, tp_list, sl, leverage, margin_type:
-                Standard signal parameters.
-            signal:    Full ``SignalResult``.
-            htf_trend: Higher-TF trend label.
-            key:       ``(symbol, interval)`` cooldown key.
-            wall_now:  Current wall-clock time for cooldown recording.
-        """
         min_candles = 20 if (config.SIMULATION_MODE or config.DATA_TESTING) else 50
 
         try:
@@ -472,11 +354,7 @@ class TradingEngine:
                 self._cooldowns[key] = wall_now
 
     def shutdown(self):
-        """
-        Gracefully shut down the signal worker thread pool.
-
-        Waits for any in-flight signal processing to finish before returning.
-        """
+        """Gracefully shut down the signal worker thread pool."""
         logger.info("TradingEngine: shutting down signal pool")
         try:
             self._pool.shutdown(wait=True, cancel_futures=False)

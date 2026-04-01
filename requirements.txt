@@ -25,6 +25,13 @@ httpx>=0.25.0
 h11>=0.14.0
 httpcore>=1.0.0
 
+# ── Sync HTTP (used by requests-based fallback sender and deleteWebhook)
+requests>=2.31.0
+urllib3>=2.0.0
+certifi>=2023.7.22
+charset-normalizer>=3.3.0
+idna>=3.4
+
 # ── Charting (optional — set DISABLE_CHARTING=1 to skip)
 matplotlib>=3.8.0
 Pillow>=10.0.0
@@ -47,15 +54,10 @@ dateparser>=1.2.0
 # ── Crypto & security
 pycryptodome>=3.19.0
 
-# ── Market data enrichment (optional — used by RiskManager)
+# ── Market data enrichment (optional — used by RiskManager market-cap filter)
 pycoingecko>=3.1.0
 
-# ── Miscellaneous
-requests>=2.31.0
-urllib3>=2.0.0
-certifi>=2023.7.22
-charset-normalizer>=3.3.0
-idna>=3.4
+# ── Miscellaneous async / runtime
 six>=1.16.0
 regex>=2023.10.3
 typing_extensions>=4.8.0

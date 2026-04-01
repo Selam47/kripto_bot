@@ -1,24 +1,12 @@
 """
-run_bot.py — Single Entry Point
-=================================
-Boots the entire trading system and blocks until a SIGINT/SIGTERM arrives.
+main.py — Single Entry Point
+==============================
+Start the bot:
+    python main.py
 
-Execution modes
----------------
-- **Live trading** (default): ``SIMULATION_MODE=0`` in ``.env``
-- **Simulation**:             ``SIMULATION_MODE=1``
-- **Data testing**:           ``DATA_TESTING=1`` — injects synthetic OHLCV
-  data directly into the engine without opening a WebSocket.
-
-Start the bot
--------------
-    python run_bot.py
-
-Dependencies
-------------
-See ``requirements.txt``.  Install with::
-
-    pip install -r requirements.txt
+Execution modes (set in .env):
+    SIMULATION_MODE=1   — signals sent, no real orders
+    DATA_TESTING=1      — synthetic data, no WebSocket
 """
 
 import logging
@@ -28,6 +16,8 @@ import signal
 import sys
 import threading
 import time
+
+import requests
 
 import config
 from binance_future_client import BinanceFuturesClient
@@ -55,13 +45,6 @@ logger = logging.getLogger(__name__)
 
 
 def setup_logging() -> None:
-    """
-    Configure rotating-file + stdout logging.
-
-    Creates a ``logs/`` directory if it does not exist and attaches a
-    10 MB rotating file handler (5 backups) alongside a ``StreamHandler``
-    that writes to stdout.
-    """
     os.makedirs("logs", exist_ok=True)
     fmt = (
         "%(asctime)s [%(levelname)s] [%(process)d:%(threadName)s] "
@@ -79,24 +62,72 @@ def setup_logging() -> None:
     logging.basicConfig(level=logging.INFO, format=fmt, handlers=handlers)
 
 
+def delete_webhook() -> None:
+    """
+    Call the Telegram deleteWebhook endpoint before starting long-polling.
+
+    This clears any previously registered webhook so that getUpdates
+    (long-polling) can receive messages without conflicts.  Runs synchronously
+    at boot time and is safe to call even if no webhook exists.
+    """
+    url = config.TELEGRAM_DELETE_WEBHOOK_URL
+    if not url:
+        logger.warning("TELEGRAM_BOT_TOKEN not set — skipping deleteWebhook")
+        return
+    try:
+        resp = requests.post(url, timeout=10)
+        data = resp.json()
+        if data.get("ok"):
+            logger.info("Telegram webhook cleared (deleteWebhook OK)")
+        else:
+            logger.warning(f"deleteWebhook returned: {data.get('description', data)}")
+    except Exception as exc:
+        logger.warning(f"deleteWebhook request failed (non-fatal): {exc}")
+
+
+def _validate_config() -> bool:
+    errors: list[str] = []
+
+    if not config.BINANCE_API_KEY or not config.BINANCE_API_SECRET:
+        errors.append("Binance API credentials missing (BINANCE_API_KEY / BINANCE_API_SECRET)")
+    if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
+        errors.append("Telegram credentials missing (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)")
+    if not config.TIMEFRAMES:
+        errors.append("No timeframes configured (TIMEFRAMES)")
+    if not config.SYMBOLS:
+        errors.append("No symbols configured (SYMBOLS)")
+    if config.HISTORY_CANDLES <= 0:
+        errors.append("HISTORY_CANDLES must be a positive integer")
+    elif config.HISTORY_CANDLES > 1500:
+        errors.append("HISTORY_CANDLES cannot exceed 1500 (Binance API limit)")
+    if config.SIGNAL_COOLDOWN < 0:
+        errors.append("SIGNAL_COOLDOWN must be non-negative")
+    if not (0 < config.DEFAULT_SL_PERCENT < 1):
+        errors.append("DEFAULT_SL_PERCENT must be strictly between 0 and 1")
+    for tp in config.DEFAULT_TP_PERCENTS:
+        if not (0 < tp < 1):
+            errors.append(f"TP percent {tp} must be strictly between 0 and 1")
+
+    if errors:
+        for msg in errors:
+            logger.error(f"Config error: {msg}")
+        return False
+
+    logger.info("Configuration validated successfully")
+    return True
+
+
 class AppRunner:
     """
-    Top-level application controller.
+    Top-level lifecycle controller.
 
-    Owns the lifecycle of every subsystem:
-    ``Database → SymbolManager → NotificationManager → MarketData →
-    TradingEngine → BinanceWS``.
-
-    All subsystems are started inside ``run()`` and torn down inside
-    ``shutdown_handler()``, which is wired to ``SIGINT`` and ``SIGTERM``.
+    Boot order:
+        deleteWebhook → validate config → Database → SymbolManager →
+        NotificationManager → MarketData (bulk-load) → TradingEngine →
+        BinanceWS → main sleep loop
     """
 
     def __init__(self) -> None:
-        """
-        Instantiate shared services.
-
-        Does **not** start any background threads — that happens in ``run()``.
-        """
         if config.DB_ENABLE_PERSISTENCE:
             self.db = get_database()
             logger.info("Database initialized")
@@ -137,16 +168,6 @@ class AppRunner:
             )
 
     def shutdown_handler(self, signum, frame) -> None:
-        """
-        Gracefully stop all subsystems and signal the main loop to exit.
-
-        Safe to call multiple times — guarded by ``is_shutting_down`` event.
-        Registered for ``SIGINT`` and ``SIGTERM``.
-
-        Args:
-            signum: Signal number (unused beyond logging context).
-            frame:  Current stack frame (unused).
-        """
         if self.is_shutting_down.is_set():
             return
         logger.info("Shutdown signal received — stopping all subsystems...")
@@ -170,61 +191,21 @@ class AppRunner:
         self.stop_event.set()
         logger.info("Shutdown complete")
 
-    def _validate_config(self) -> bool:
-        """
-        Validate critical configuration values before the system starts.
-
-        Returns:
-            ``True`` when all checks pass; ``False`` when fatal errors are found.
-        """
-        errors: list[str] = []
-
-        if not config.BINANCE_API_KEY or not config.BINANCE_API_SECRET:
-            errors.append("Binance API credentials missing (BINANCE_API_KEY / BINANCE_API_SECRET)")
-        if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
-            errors.append("Telegram configuration missing (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)")
-        if not config.TIMEFRAMES:
-            errors.append("No timeframes configured (TIMEFRAMES)")
-        if config.HISTORY_CANDLES <= 0:
-            errors.append("HISTORY_CANDLES must be a positive integer")
-        elif config.HISTORY_CANDLES > 1500:
-            errors.append("HISTORY_CANDLES cannot exceed 1500 (Binance API limit)")
-        if config.SIGNAL_COOLDOWN < 0:
-            errors.append("SIGNAL_COOLDOWN must be non-negative")
-        if not (0 < config.DEFAULT_SL_PERCENT < 1):
-            errors.append("DEFAULT_SL_PERCENT must be strictly between 0 and 1")
-        for tp in config.DEFAULT_TP_PERCENTS:
-            if not (0 < tp < 1):
-                errors.append(f"TP percent {tp} must be strictly between 0 and 1")
-
-        if errors:
-            for msg in errors:
-                logger.error(f"Config error: {msg}")
-            return False
-
-        logger.info("Configuration validated successfully")
-        return True
-
     def run(self) -> None:
-        """
-        Main execution loop.
-
-        Orchestration order
-        -------------------
-        1. Validate configuration.
-        2. Start background services (SymbolManager, Notifier, DB maintenance).
-        3. Initialise ``MarketData`` singleton and bulk-load historical bars.
-        4. Build ``TradingEngine``.
-        5. Apply optional market-cap filter to symbol list.
-        6. Open the Binance WebSocket stream.
-        7. Block until shutdown is requested.
-        """
         mode = "SIMULATION" if config.SIMULATION_MODE else "LIVE TRADING"
         logger.info(f"Starting Kripto Botu in {mode} mode")
+        logger.info(f"Target symbols : {config.SYMBOLS}")
+        logger.info(f"Timeframes     : {config.TIMEFRAMES}")
+        logger.info(
+            f"Signal cooldown: {config.SIGNAL_COOLDOWN}s "
+            f"({config.SIGNAL_COOLDOWN / 3600:.1f}h)"
+        )
 
-        if not self._validate_config():
+        if not _validate_config():
             logger.error("Startup aborted due to configuration errors")
             return
+
+        delete_webhook()
 
         self.symbol_manager.start()
         self.notifier.start()
@@ -274,17 +255,13 @@ class AppRunner:
                 time.sleep(1)
         except KeyboardInterrupt:
             pass
+        except Exception as exc:
+            logger.error(f"Main loop unexpected error: {exc}", exc_info=True)
         finally:
             if not self.is_shutting_down.is_set():
                 self.shutdown_handler(None, None)
 
     def _monitor_rate_limits(self) -> None:
-        """
-        Background daemon that warns when Binance API weight usage is high.
-
-        Polls every 30 seconds and logs a ``WARNING`` when weight or request
-        usage exceeds 80 %.
-        """
         while not self.stop_event.is_set():
             try:
                 if getattr(self.binance_client, "rate_limiter", None):
@@ -302,15 +279,6 @@ class AppRunner:
 
 
 def _run_data_testing() -> None:
-    """
-    Execute a synthetic data smoke-test without opening a WebSocket.
-
-    Injects ``create_realistic_test_data()`` DataFrames directly into
-    ``MarketData`` and drives ``TradingEngine._run_pipeline()`` for every
-    configured symbol/interval combination.
-
-    Used for verifying the signal pipeline locally without live credentials.
-    """
     from util import create_realistic_test_data
 
     logger.info("DATA_TESTING mode — synthetic data injection")
@@ -340,19 +308,22 @@ def _run_data_testing() -> None:
         charting_service=charting_service,
     )
 
-    test_symbols = config.SYMBOLS if config.SYMBOLS else ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
+    test_symbols = config.SYMBOLS if config.SYMBOLS else ["1000PIPPINUSDT"]
+    fake_candle_time = int(time.time() * 1000)
 
     for symbol in test_symbols:
         for interval in config.TIMEFRAMES:
             try:
-                df = create_realistic_test_data(periods=60, base_price=30000)
+                df = create_realistic_test_data(periods=60, base_price=0.00042)
                 key = (symbol, interval)
                 market_data.klines[key] = df
                 market_data.historical_loaded[key] = True
-                engine._run_pipeline(symbol, interval)
+                engine._run_pipeline(symbol, interval, fake_candle_time)
                 time.sleep(0.5)
             except Exception as exc:
-                logger.error(f"Test pipeline error {symbol}/{interval}: {exc}", exc_info=True)
+                logger.error(
+                    f"Test pipeline error {symbol}/{interval}: {exc}", exc_info=True
+                )
 
     engine.shutdown()
     notifier.stop()
@@ -365,7 +336,11 @@ def _run_data_testing() -> None:
 if __name__ == "__main__":
     setup_logging()
 
-    if config.DATA_TESTING:
-        _run_data_testing()
-    else:
-        AppRunner().run()
+    try:
+        if config.DATA_TESTING:
+            _run_data_testing()
+        else:
+            AppRunner().run()
+    except Exception as exc:
+        logging.critical(f"Fatal startup error: {exc}", exc_info=True)
+        sys.exit(1)
