@@ -8,6 +8,7 @@ from typing import Optional
 import config
 from database import get_database
 from engine.confluence import ConfluenceEngine, SignalResult
+from engine.indicators import Indicators
 from engine.market_data import MarketData
 from engine.mtf_guard import MTFTrendGuard
 from engine.notification_manager import NotificationManager
@@ -384,6 +385,126 @@ class TradingEngine:
             )
             with self._lock:
                 self._cooldowns[key] = wall_now
+
+    def run_initial_analysis(self, symbols: list[str], interval: str) -> None:
+        """
+        Build and send a "System Online — Current Market Status" card for each
+        symbol immediately after startup.  Runs in the SignalWorker pool so it
+        never blocks the WebSocket startup.
+
+        Args:
+            symbols:  List of symbols to include (e.g. ['BTCUSDT', 'PIPPINUSDT']).
+            interval: Timeframe to analyse (e.g. '15m').
+        """
+        self._pool.submit(self._send_startup_pulse, symbols, interval)
+
+    def _send_startup_pulse(self, symbols: list[str], interval: str) -> None:
+        """Worker: build the startup status card and dispatch it via Telegram."""
+        import datetime
+        now_str = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        lines = [
+            f"\U0001f7e2 Sistem Aktif — Pazar Durumu",
+            f"Zaman: {now_str}",
+            f"Mod: {'Simulasyon' if config.SIMULATION_MODE else 'Gercek Sinyal'}",
+            "-" * 32,
+        ]
+
+        for symbol in symbols:
+            try:
+                df = self.market_data.get_klines(symbol, interval)
+                if df is None or len(df) < 30:
+                    lines.append(f"\u26a0\ufe0f {symbol}: Yeterli veri yok")
+                    continue
+
+                snap = Indicators.compute_snapshot(df)
+                if snap is None:
+                    lines.append(f"\u26a0\ufe0f {symbol}: Indikatör hesaplanamadi")
+                    continue
+
+                # Price formatting — handle very small prices (e.g. PIPPIN)
+                price = snap.close
+                if price < 0.01:
+                    price_str = f"{price:.6f}"
+                elif price < 1.0:
+                    price_str = f"{price:.4f}"
+                elif price < 100:
+                    price_str = f"{price:.3f}"
+                else:
+                    price_str = f"{price:.2f}"
+
+                # EMA alignment
+                if snap.ema_9 > snap.ema_21 > snap.ema_50:
+                    ema_status = "\U0001f4c8 Yukselis"
+                elif snap.ema_9 < snap.ema_21 < snap.ema_50:
+                    ema_status = "\U0001f4c9 Dusus"
+                else:
+                    ema_status = "\u27a1\ufe0f Notr"
+
+                # RSI zone
+                if snap.rsi < 30:
+                    rsi_label = "Asiri Satim"
+                elif snap.rsi > 70:
+                    rsi_label = "Asiri Alim"
+                else:
+                    rsi_label = "Normal"
+
+                # MACD momentum
+                macd_dir = "Yukari" if snap.histogram > 0 else "Asagi"
+
+                # Bollinger band position
+                bb_range = snap.bb_upper - snap.bb_lower
+                if bb_range > 0:
+                    bb_pos = (price - snap.bb_lower) / bb_range * 100
+                    if bb_pos < 20:
+                        bb_label = "Alt banda yakin"
+                    elif bb_pos > 80:
+                        bb_label = "Ust banda yakin"
+                    else:
+                        bb_label = "Orta bolgede"
+                else:
+                    bb_label = "N/A"
+
+                lines += [
+                    f"\U0001f4b0 {symbol}",
+                    f"  Fiyat : {price_str}",
+                    f"  EMA   : {ema_status}",
+                    f"  RSI   : {snap.rsi:.1f}  ({rsi_label})",
+                    f"  MACD  : Histogram {macd_dir} ({snap.histogram:.4f})",
+                    f"  BB    : {bb_label}",
+                    "-" * 32,
+                ]
+
+            except Exception as exc:
+                logger.error(f"Startup pulse error for {symbol}: {exc}", exc_info=True)
+                lines.append(f"\u274c {symbol}: Hata — {exc}")
+
+        lines.append("Bu bir finansal tavsiye degildir.")
+        msg = "\n".join(lines)
+        self.notifier.send_raw_message(msg)
+        logger.info("Startup pulse sent to Telegram")
+
+    def run_periodic_check(self, symbols: list[str], interval: str) -> None:
+        """
+        Scheduled 5-minute check: run the full signal pipeline for each symbol
+        without waiting for a WebSocket candle-close event.
+
+        Respects the existing ``last_analyzed_candle`` dedup guard and
+        ``SIGNAL_COOLDOWN`` — no duplicate messages will be sent.
+
+        Args:
+            symbols:  Symbols to scan.
+            interval: Timeframe to analyse.
+        """
+        for symbol in symbols:
+            try:
+                df = self.market_data.get_klines(symbol, interval)
+                if df is None or len(df) < 2:
+                    continue
+                # Use the open time of the latest bar as the candle identifier
+                candle_open_time = int(df.index[-1].timestamp() * 1000) if hasattr(df.index[-1], 'timestamp') else int(time.time() * 1000)
+                self._pool.submit(self._process, symbol, interval, candle_open_time)
+            except Exception as exc:
+                logger.error(f"Periodic check error for {symbol}: {exc}", exc_info=True)
 
     def shutdown(self):
         """Gracefully shut down the signal worker thread pool."""

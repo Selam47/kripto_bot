@@ -192,9 +192,17 @@ class AppRunner:
         logger.info("Shutdown complete")
 
     def run(self) -> None:
+        # The two symbols this engine specifically optimises for.
+        # Sources from config (SYMBOLS env var) but always includes these two.
+        monitored_symbols = list(
+            dict.fromkeys(["BTCUSDT", "PIPPINUSDT"] + list(config.SYMBOLS))
+        )
+        primary_interval = config.TIMEFRAMES[0] if config.TIMEFRAMES else "15m"
+
         mode = "SIMULATION" if config.SIMULATION_MODE else "LIVE TRADING"
         logger.info(f"Starting Kripto Botu in {mode} mode")
-        logger.info(f"Target symbols : {config.SYMBOLS}")
+        logger.info(f"Target symbols : {monitored_symbols}")
+        logger.info(f"Primary interval : {primary_interval}")
         logger.info(f"Timeframes     : {config.TIMEFRAMES}")
         logger.info(
             f"Signal cooldown: {config.SIGNAL_COOLDOWN}s "
@@ -250,9 +258,23 @@ class AppRunner:
 
         self.ws.run()
 
+        # ── Startup Pulse ──────────────────────────────────────────────────────
+        # Fire a "System Online — Current Market Status" message immediately.
+        # Runs in a daemon thread so it never delays WebSocket initialisation.
+        logger.info("Dispatching startup market-status pulse...")
+        self.engine.run_initial_analysis(monitored_symbols, primary_interval)
+
+        # ── 5-Minute Periodic Analysis Loop ───────────────────────────────────
+        # Re-analyse every 5 minutes.  The per-candle dedup guard and cooldown
+        # inside TradingEngine prevent duplicate Telegram messages.
+        PERIODIC_INTERVAL_SECONDS = 300  # 5 minutes
         try:
             while not self.stop_event.is_set():
-                time.sleep(1)
+                self.stop_event.wait(timeout=PERIODIC_INTERVAL_SECONDS)
+                if self.stop_event.is_set():
+                    break
+                logger.debug("Periodic tick — running scheduled analysis")
+                self.engine.run_periodic_check(monitored_symbols, primary_interval)
         except KeyboardInterrupt:
             pass
         except Exception as exc:

@@ -275,6 +275,33 @@ class NotificationManager:
 
         logger.info("NotificationManager stopped")
 
+    def send_raw_message(self, text: str):
+        """
+        Send a pre-formatted text message to Telegram without signal formatting.
+
+        Thread-safe.  Used for informational cards such as the startup pulse
+        ("System Online — Current Market Status").  Falls back to sync send if
+        the async loop is not yet running.
+
+        Args:
+            text: Fully-formatted UTF-8 message string (max 4096 chars).
+        """
+        if config.SIMULATION_MODE:
+            text = f"[SIMULATION]\n{text}"
+
+        loop_alive = (
+            self._loop is not None
+            and not self._loop.is_closed()
+            and self._loop.is_running()
+        )
+        if loop_alive:
+            asyncio.run_coroutine_threadsafe(
+                self._async_send(text, None), self._loop
+            )
+        else:
+            logger.warning("Notification loop not running — using sync fallback for raw message")
+            self._sync_send(text, None)
+
     async def _cleanup(self):
         """
         Async teardown: stop Telegram polling and close the HTTP session.
