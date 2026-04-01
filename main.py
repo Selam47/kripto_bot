@@ -264,10 +264,18 @@ class AppRunner:
         logger.info("Dispatching startup market-status pulse...")
         self.engine.run_initial_analysis(monitored_symbols, primary_interval)
 
-        # ── 5-Minute Periodic Analysis Loop ───────────────────────────────────
-        # Re-analyse every 5 minutes.  The per-candle dedup guard and cooldown
+        # ── Instant Alert Monitor ────────────────────────────────────
+        # 60-second background thread: fires the pipeline immediately on
+        # ATR spike, RSI 30/70 crossover, or MACD line/signal crossover.
+        self.engine.start_instant_alert_monitor(
+            monitored_symbols, primary_interval, poll_seconds=60
+        )
+
+        # ── 10-Minute Periodic Analysis Loop ────────────────────────────
+        # Scheduled full scan every 10 minutes as a belt-and-suspenders
+        # complement to the Instant Alert monitor.  Dedup guard and cooldown
         # inside TradingEngine prevent duplicate Telegram messages.
-        PERIODIC_INTERVAL_SECONDS = 300  # 5 minutes
+        PERIODIC_INTERVAL_SECONDS = 600  # 10 minutes
         try:
             while not self.stop_event.is_set():
                 self.stop_event.wait(timeout=PERIODIC_INTERVAL_SECONDS)

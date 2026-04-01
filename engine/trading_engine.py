@@ -115,6 +115,13 @@ class TradingEngine:
         )
         self._last_analyzed_candle: dict[tuple[str, str], int] = {}
 
+        # Instant-alert monitor state
+        self._instant_alert_stop = threading.Event()
+        self._instant_alert_thread: Optional[threading.Thread] = None
+        # Tracks previous indicator values per (symbol, interval) for crossover detection
+        self._prev_rsi: dict[tuple[str, str], float] = {}
+        self._prev_macd_above: dict[tuple[str, str], Optional[bool]] = {}
+
     def handle_kline(self, k: dict):
         """
         Entry-point for a raw kline dict from the Binance WebSocket.
@@ -506,9 +513,161 @@ class TradingEngine:
             except Exception as exc:
                 logger.error(f"Periodic check error for {symbol}: {exc}", exc_info=True)
 
+    def start_instant_alert_monitor(
+        self,
+        symbols: list[str],
+        interval: str,
+        poll_seconds: int = 60,
+    ) -> None:
+        """
+        Start a background thread that checks for volatility spikes and major
+        indicator crossovers every ``poll_seconds`` seconds.
+
+        Triggers an immediate full pipeline run (bypassing the 10-min scheduled
+        wait) when any of the following conditions are detected:
+
+        - **ATR Spike**: current ATR > 1.5 × ATR SMA (20-period)
+        - **RSI Breakout**: RSI crosses above 70 or below 30 since last poll
+        - **MACD Crossover**: MACD line crosses above or below the signal line
+
+        Args:
+            symbols:      Symbols to monitor.
+            interval:     Timeframe to sample.
+            poll_seconds: How often to poll (default 60 s).
+        """
+        if self._instant_alert_thread and self._instant_alert_thread.is_alive():
+            logger.debug("Instant alert monitor already running")
+            return
+        self._instant_alert_stop.clear()
+        self._instant_alert_thread = threading.Thread(
+            target=self._instant_alert_loop,
+            args=(symbols, interval, poll_seconds),
+            name="InstantAlertMonitor",
+            daemon=True,
+        )
+        self._instant_alert_thread.start()
+        logger.info(
+            f"Instant alert monitor started — polling every {poll_seconds}s "
+            f"for {symbols}"
+        )
+
+    def _instant_alert_loop(
+        self,
+        symbols: list[str],
+        interval: str,
+        poll_seconds: int,
+    ) -> None:
+        """Background loop: detect spikes/crossovers and fire the pipeline."""
+        while not self._instant_alert_stop.wait(timeout=poll_seconds):
+            for symbol in symbols:
+                try:
+                    self._check_instant_alert(symbol, interval)
+                except Exception as exc:
+                    logger.error(
+                        f"Instant alert check error {symbol}: {exc}",
+                        exc_info=True,
+                    )
+
+    def _check_instant_alert(self, symbol: str, interval: str) -> None:
+        """
+        Sample the latest indicator snapshot and fire the pipeline immediately
+        if a spike or crossover condition is met.
+        """
+        df = self.market_data.get_klines(symbol, interval)
+        if df is None or len(df) < 30:
+            return
+
+        snap = Indicators.compute_snapshot(df)
+        if snap is None:
+            return
+
+        key = (symbol, interval)
+        triggered = False
+        reasons: list[str] = []
+
+        # 1. ATR Spike: current ATR > 1.5x its own SMA
+        if snap.atr_sma > 0 and snap.atr > snap.atr_sma * 1.5:
+            triggered = True
+            reasons.append(
+                f"ATR Spike ({snap.atr:.4f} > 1.5x SMA {snap.atr_sma:.4f})"
+            )
+
+        # 2. RSI Crossover of 30 / 70 thresholds
+        prev_rsi = self._prev_rsi.get(key)
+        if prev_rsi is not None:
+            if prev_rsi >= 30 > snap.rsi:
+                triggered = True
+                reasons.append(f"RSI crossed below 30 ({snap.rsi:.1f})")
+            elif prev_rsi <= 30 < snap.rsi:
+                triggered = True
+                reasons.append(f"RSI broke above 30 ({snap.rsi:.1f})")
+            elif prev_rsi <= 70 < snap.rsi:
+                triggered = True
+                reasons.append(f"RSI crossed above 70 ({snap.rsi:.1f})")
+            elif prev_rsi >= 70 > snap.rsi:
+                triggered = True
+                reasons.append(f"RSI dropped below 70 ({snap.rsi:.1f})")
+        self._prev_rsi[key] = snap.rsi
+
+        # 3. MACD Crossover (line crosses signal)
+        macd_above = snap.macd_line > snap.signal_line
+        prev_macd_above = self._prev_macd_above.get(key)
+        if prev_macd_above is not None and macd_above != prev_macd_above:
+            direction = "bullish" if macd_above else "bearish"
+            triggered = True
+            reasons.append(f"MACD {direction} crossover")
+        self._prev_macd_above[key] = macd_above
+
+        if triggered:
+            candle_open_time = (
+                int(df.index[-1].timestamp() * 1000)
+                if hasattr(df.index[-1], "timestamp")
+                else int(time.time() * 1000)
+            )
+            logger.info(
+                f"[InstantAlert] {symbol}-{interval} triggered: "
+                + "; ".join(reasons)
+            )
+            # Force re-analysis by clearing the last-candle cache for this key
+            with self._lock:
+                self._last_analyzed_candle.pop(key, None)
+            self._pool.submit(self._process, symbol, interval, candle_open_time)
+
+    def run_periodic_check(self, symbols: list[str], interval: str) -> None:
+        """
+        Scheduled 10-minute check: run the full signal pipeline for each symbol
+        without waiting for a WebSocket candle-close event.
+
+        Respects the existing ``last_analyzed_candle`` dedup guard and
+        ``SIGNAL_COOLDOWN`` — no duplicate messages will be sent.
+
+        Args:
+            symbols:  Symbols to scan.
+            interval: Timeframe to analyse.
+        """
+        for symbol in symbols:
+            try:
+                df = self.market_data.get_klines(symbol, interval)
+                if df is None or len(df) < 2:
+                    continue
+                # Use the open time of the latest bar as the candle identifier
+                candle_open_time = (
+                    int(df.index[-1].timestamp() * 1000)
+                    if hasattr(df.index[-1], "timestamp")
+                    else int(time.time() * 1000)
+                )
+                self._pool.submit(self._process, symbol, interval, candle_open_time)
+            except Exception as exc:
+                logger.error(
+                    f"Periodic check error for {symbol}: {exc}", exc_info=True
+                )
+
     def shutdown(self):
-        """Gracefully shut down the signal worker thread pool."""
-        logger.info("TradingEngine: shutting down signal pool")
+        """Gracefully shut down the signal worker thread pool and monitor."""
+        logger.info("TradingEngine: shutting down")
+        self._instant_alert_stop.set()
+        if self._instant_alert_thread and self._instant_alert_thread.is_alive():
+            self._instant_alert_thread.join(timeout=5)
         try:
             self._pool.shutdown(wait=True, cancel_futures=False)
         except TypeError:
