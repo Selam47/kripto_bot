@@ -48,7 +48,7 @@ from util import now_utc, timeframe_to_seconds
 
 logger = logging.getLogger(__name__)
 
-_SENT_MAX_AGE: int = 3600
+_SENT_MAX_AGE: int = 28800
 _SENT_CLEANUP_INTERVAL: int = 600
 
 
@@ -116,7 +116,7 @@ class TradingEngine:
         if not self._validate_kline(k):
             return
         self.market_data.update_kline(k)
-        self._pool.submit(self._process, k["s"], k["i"])
+        self._pool.submit(self._process, k["s"], k["i"], int(k["t"]))
 
     @staticmethod
     def _validate_kline(k) -> bool:
@@ -141,7 +141,7 @@ class TradingEngine:
             return False
         return True
 
-    def _process(self, symbol: str, interval: str):
+    def _process(self, symbol: str, interval: str, candle_open_time: int):
         """
         Worker-thread entry-point for signal processing.
 
@@ -149,18 +149,19 @@ class TradingEngine:
         one symbol never affects others.
 
         Args:
-            symbol:   Trading pair.
-            interval: Timeframe string.
+            symbol:           Trading pair.
+            interval:         Timeframe string.
+            candle_open_time: Kline open timestamp in milliseconds (``k["t"]``).
         """
         try:
-            self._run_pipeline(symbol, interval)
+            self._run_pipeline(symbol, interval, candle_open_time)
         except Exception as e:
             logger.error(
                 f"Unhandled error in signal pipeline {symbol}-{interval}: {e}",
                 exc_info=True,
             )
 
-    def _run_pipeline(self, symbol: str, interval: str):
+    def _run_pipeline(self, symbol: str, interval: str, candle_open_time: int):
         """
         Full signal pipeline for one symbol/interval pair.
 
@@ -170,14 +171,17 @@ class TradingEngine:
         2. Check cooldown — skip if a signal was recently emitted.
         3. Run MTF Trend Guard — block counter-trend trades.
         4. Run ConfluenceEngine — generate signal or exit.
-        5. Deduplicate against sent-signal cache.
+        5. Deduplicate against sent-signal cache (keyed on candle open time).
         6. Compute ATR-based TP/SL levels.
         7. Persist signal to database.
         8. Dispatch to NotificationManager (with or without chart).
 
         Args:
-            symbol:   Trading pair.
-            interval: Timeframe string.
+            symbol:           Trading pair.
+            interval:         Timeframe string.
+            candle_open_time: Kline open timestamp in milliseconds — used as
+                              the uniqueness key for signal deduplication so
+                              only one notification is fired per candle/direction.
         """
         min_candles = 20 if (config.SIMULATION_MODE or config.DATA_TESTING) else 50
 
@@ -196,10 +200,8 @@ class TradingEngine:
 
         if config.DATA_TESTING:
             cooldown = 0.0
-        elif config.SIMULATION_MODE:
-            cooldown = float(config.SIGNAL_COOLDOWN)
         else:
-            cooldown = float(timeframe_to_seconds(interval))
+            cooldown = float(config.SIGNAL_COOLDOWN)
 
         if self._is_on_cooldown(key, wall_now, cooldown):
             return
@@ -223,9 +225,9 @@ class TradingEngine:
             logger.warning(f"Could not read last price for {symbol}-{interval}")
             return
 
-        signal_key = f"{symbol}-{interval}-{signal.direction}-{last_price:.2f}"
+        signal_key = f"{symbol}-{signal.direction}-{candle_open_time}"
         with self._lock:
-            if wall_now - self._sent_signals.get(signal_key, 0.0) < cooldown:
+            if signal_key in self._sent_signals:
                 return
             self._sent_signals[signal_key] = wall_now
 
