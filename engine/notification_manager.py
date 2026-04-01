@@ -212,6 +212,13 @@ class NotificationManager:
             app.add_handler(CommandHandler("hakkinda", _cmd_hakkinda))
 
             await app.initialize()
+
+            try:
+                await app.bot.delete_webhook(drop_pending_updates=True)
+                logger.info("Telegram webhook cleared — drop_pending_updates=True")
+            except Exception as wh_err:
+                logger.warning(f"delete_webhook (PTB) failed (non-fatal): {wh_err}")
+
             await app.start()
             await app.updater.start_polling(drop_pending_updates=True)
 

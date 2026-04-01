@@ -77,16 +77,17 @@ class TradingEngine:
     Processing order per kline event
     ---------------------------------
     1.  validate kline structure
-    2.  update MarketData store
-    3.  submit to SignalWorker thread pool (non-blocking)
-    4.  lazy-load history if insufficient bars
-    5.  per-symbol cooldown gate  (config.SIGNAL_COOLDOWN seconds)
-    6.  ConfluenceEngine.analyze()
-    7.  MTFTrendGuard validation
-    8.  SignalTracker deduplication  (symbol + direction + candle open time)
-    9.  ATR TP/SL calculation
-    10. DB persistence
-    11. NotificationManager dispatch (with or without chart)
+    2.  update MarketData store  (every tick — price always current)
+    3.  GATE: skip unless candle is closed  (k["x"] is True)
+    4.  submit to SignalWorker thread pool (non-blocking)
+    5.  lazy-load history if insufficient bars
+    6.  per-symbol cooldown gate  (config.SIGNAL_COOLDOWN seconds)
+    7.  ConfluenceEngine.analyze()
+    8.  MTFTrendGuard validation
+    9.  SignalTracker deduplication  (symbol + direction + candle open time)
+    10. ATR TP/SL calculation
+    11. DB persistence
+    12. NotificationManager dispatch (with or without chart)
     """
 
     def __init__(
@@ -115,11 +116,18 @@ class TradingEngine:
     def handle_kline(self, k: dict):
         """
         Entry-point for a raw kline dict from the Binance WebSocket.
-        Non-blocking — submits work to the thread pool immediately.
+
+        Market data is updated on every tick so the OHLCV store stays current.
+        Signal analysis is submitted to the worker pool ONLY when the candle is
+        closed (``k["x"] is True``).  For a 15m bot this fires exactly once per
+        candle — preventing the same analysis from running hundreds of times on
+        every tick of the same forming bar.
         """
         if not self._validate_kline(k):
             return
         self.market_data.update_kline(k)
+        if not k.get("x", False):
+            return
         self._pool.submit(self._process, k["s"], k["i"], int(k["t"]))
 
     @staticmethod

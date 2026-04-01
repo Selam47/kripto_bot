@@ -308,7 +308,7 @@ def _run_data_testing() -> None:
         charting_service=charting_service,
     )
 
-    test_symbols = config.SYMBOLS if config.SYMBOLS else ["1000PIPPINUSDT"]
+    test_symbols = config.SYMBOLS if config.SYMBOLS else ["PIPPINUSDT"]
     fake_candle_time = int(time.time() * 1000)
 
     for symbol in test_symbols:

@@ -60,7 +60,7 @@ TELEGRAM_DELETE_WEBHOOK_URL: str = (
     if TELEGRAM_BOT_TOKEN else ""
 )
 
-SYMBOLS: list[str] = _list_str("SYMBOLS", "1000PIPPINUSDT")
+SYMBOLS: list[str] = _list_str("SYMBOLS", "PIPPINUSDT")
 
 TIMEFRAMES: list[str] = (
     [tf.strip() for tf in os.getenv("TIMEFRAMES", "15m").split(",") if tf.strip()]
