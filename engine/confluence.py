@@ -1,21 +1,21 @@
 """
-Confluence Engine
-==================
-The core signal-generation brain of the trading bot.
-
+Confluence Engine — Antigravity Signal Strategy
+=================================================
 A signal is only considered **valid** when three independent indicator groups
 all agree simultaneously — the so-called "confluence" approach:
 
-    1. **RSI Group** — momentum state (oversold/overbought recovery)
-    2. **MACD Group** — trend momentum confirmation
-    3. **Bollinger Bands Group** — price-structure position
+    1. **RSI Group** — momentum exhaustion (oversold < 25 / overbought > 75)
+    2. **MACD Group** — trend momentum confirmation / divergence
+    3. **Bollinger Bands Group** — price exhaustion at 2.5σ bands
 
 All three *core* groups must fire (``core_confirmed >= 3``) AND the total
 confluence count must reach ``MIN_CONFLUENCES`` (default 4) before a
-``SignalResult`` is emitted.  Additionally:
+``SignalResult`` is emitted.  The "Antigravity" logic specifically seeks
+price that has reached extreme exhaustion and is poised for a sharp reversal
+or a high-momentum continuation break.
 
-- Counter-trend trades against a ``STRONG_BULL`` / ``STRONG_BEAR`` EMA
-  alignment are suppressed.
+- Counter-trend trades against a ``STRONG_BULL`` / ``STRONG_BEAR`` EMA stack
+  are suppressed.
 - Conflicting buy/sell scores of equal strength are discarded (choppy market).
 - ATR squeeze filter: if current ATR < 40 % of its 20-bar SMA the market is
   too compressed to trade — no signal is produced.
@@ -23,7 +23,7 @@ confluence count must reach ``MIN_CONFLUENCES`` (default 4) before a
 The ``calculate_atr_levels()`` method converts a ``SignalResult`` into a
 ``TradeLevels`` object with:
 - Three tiered take-profit levels (2.0×, 3.5×, 5.5× ATR)
-- A structural stop-loss anchored to the last swing high/low
+- A structural stop-loss anchored to the last swing high/low (or 1.5× ATR)
 - Fibonacci-based secondary TP and SL when the structure supports it
 - Risk/Reward guard: if TP1/SL < 1.3 the trade is rejected
 """
@@ -207,10 +207,11 @@ class ConfluenceEngine:
         elif snap.ema_9 > snap.ema_21 and snap.close > snap.ema_9:
             conf.append("EMA_BULLISH_ALIGNMENT")
 
-        if 30 <= snap.rsi <= 55 and snap.rsi > snap.prev_rsi and snap.prev_rsi < 45:
+        # RSI: Antigravity oversold threshold = 25 (deeper exhaustion)
+        if 25 <= snap.rsi <= 50 and snap.rsi > snap.prev_rsi and snap.prev_rsi < 40:
             conf.append("RSI_OVERSOLD_RECOVERY")
             core += 1
-        elif 50 < snap.rsi < 68 and snap.rsi > snap.prev_rsi:
+        elif 50 < snap.rsi < 75 and snap.rsi > snap.prev_rsi:
             conf.append("RSI_BULLISH_MOMENTUM")
             core += 1
 
@@ -227,7 +228,8 @@ class ConfluenceEngine:
         bb_range = snap.bb_upper - snap.bb_lower
         if bb_range > 0.0:
             bb_pos = (snap.close - snap.bb_lower) / bb_range
-            if bb_pos < 0.25:
+            # 2.5σ bands — only fire at true exhaustion zone (< 10 % of band)
+            if bb_pos < 0.10:
                 conf.append("BB_NEAR_LOWER_BAND")
                 core += 1
             elif snap.prev_close < snap.bb_middle and snap.close > snap.bb_middle:
@@ -237,9 +239,9 @@ class ConfluenceEngine:
         if snap.vol_ratio > 1.2:
             conf.append("VOLUME_ABOVE_AVERAGE")
 
-        if snap.stoch_k < 30 and snap.stoch_k > snap.stoch_d and snap.prev_stoch_k <= snap.prev_stoch_d:
+        if snap.stoch_k < 25 and snap.stoch_k > snap.stoch_d and snap.prev_stoch_k <= snap.prev_stoch_d:
             conf.append("STOCH_RSI_BULLISH_CROSS")
-        elif snap.stoch_k < 40 and snap.stoch_k > snap.prev_stoch_k:
+        elif snap.stoch_k < 35 and snap.stoch_k > snap.prev_stoch_k:
             conf.append("STOCH_RSI_RECOVERY")
 
         if candle == "BULLISH_ENGULFING":
@@ -283,7 +285,8 @@ class ConfluenceEngine:
         elif snap.ema_9 < snap.ema_21 and snap.close < snap.ema_9:
             conf.append("EMA_BEARISH_ALIGNMENT")
 
-        if 45 <= snap.rsi <= 70 and snap.rsi < snap.prev_rsi and snap.prev_rsi > 55:
+        # RSI: Antigravity overbought threshold = 75 (extreme exhaustion)
+        if 50 <= snap.rsi <= 75 and snap.rsi < snap.prev_rsi and snap.prev_rsi > 60:
             conf.append("RSI_OVERBOUGHT_REJECTION")
             core += 1
         elif 32 < snap.rsi < 50 and snap.rsi < snap.prev_rsi:
@@ -303,7 +306,8 @@ class ConfluenceEngine:
         bb_range = snap.bb_upper - snap.bb_lower
         if bb_range > 0.0:
             bb_pos = (snap.close - snap.bb_lower) / bb_range
-            if bb_pos > 0.75:
+            # 2.5σ bands — only fire at true exhaustion zone (> 90 % of band)
+            if bb_pos > 0.90:
                 conf.append("BB_NEAR_UPPER_BAND")
                 core += 1
             elif snap.prev_close > snap.bb_middle and snap.close < snap.bb_middle:
@@ -313,9 +317,9 @@ class ConfluenceEngine:
         if snap.vol_ratio > 1.2:
             conf.append("VOLUME_ABOVE_AVERAGE")
 
-        if snap.stoch_k > 70 and snap.stoch_k < snap.stoch_d and snap.prev_stoch_k >= snap.prev_stoch_d:
+        if snap.stoch_k > 75 and snap.stoch_k < snap.stoch_d and snap.prev_stoch_k >= snap.prev_stoch_d:
             conf.append("STOCH_RSI_BEARISH_CROSS")
-        elif snap.stoch_k > 60 and snap.stoch_k < snap.prev_stoch_k:
+        elif snap.stoch_k > 65 and snap.stoch_k < snap.prev_stoch_k:
             conf.append("STOCH_RSI_REJECTION")
 
         if candle == "BEARISH_ENGULFING":
@@ -468,8 +472,10 @@ class ConfluenceEngine:
         entry = signal.entry_price
         conf = signal.confidence
 
+        # Antigravity SL: base is always 1.5x ATR; confidence shifts the
+        # bias label but the floor never drops below a safe 1.5x distance.
         if conf >= 0.75:
-            sl_mult, position_bias = 1.2, "AGGRESSIVE"
+            sl_mult, position_bias = 1.5, "AGGRESSIVE"
         elif conf >= 0.55:
             sl_mult, position_bias = 1.5, "NORMAL"
         else:

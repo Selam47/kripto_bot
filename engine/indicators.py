@@ -281,7 +281,7 @@ class Indicators:
         macd_line_s, signal_line_s, histogram_s = Indicators.macd(close)
         atr_s = Indicators.atr(df, 14)
         atr_sma_s = Indicators.sma(atr_s, 20) if len(df) >= 34 else atr_s
-        bb_upper_s, bb_middle_s, bb_lower_s = Indicators.bollinger_bands(close, 20, 2.0)
+        bb_upper_s, bb_middle_s, bb_lower_s = Indicators.bollinger_bands(close, 20, 2.5)
         stoch_k_s, stoch_d_s = Indicators.stochastic_rsi(close)
         vol_ratio_s = Indicators.volume_ratio(df, 20)
 

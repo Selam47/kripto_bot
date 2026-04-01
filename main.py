@@ -192,6 +192,12 @@ class AppRunner:
         logger.info("Shutdown complete")
 
     def run(self) -> None:
+        # ── Antigravity Engine: Simulation Mode enforced ───────────────────────
+        # Per spec: TRADING_MODE = 0 (Simulation). Override env var at runtime
+        # so all signals carry the [SIMULATION] prefix regardless of .env.
+        import config as _cfg
+        _cfg.SIMULATION_MODE = True
+
         # The two symbols this engine specifically optimises for.
         # Sources from config (SYMBOLS env var) but always includes these two.
         monitored_symbols = list(
@@ -271,11 +277,11 @@ class AppRunner:
             monitored_symbols, primary_interval, poll_seconds=60
         )
 
-        # ── 10-Minute Periodic Analysis Loop ────────────────────────────
-        # Scheduled full scan every 10 minutes as a belt-and-suspenders
-        # complement to the Instant Alert monitor.  Dedup guard and cooldown
-        # inside TradingEngine prevent duplicate Telegram messages.
-        PERIODIC_INTERVAL_SECONDS = 600  # 10 minutes
+        # ── 15-Minute Periodic Analysis Loop ──────────────────────────────────
+        # Scheduled full scan every 15 minutes (at least 1 analysis per hour).
+        # Belt-and-suspenders to the Instant Alert monitor. Dedup guard and
+        # cooldown inside TradingEngine prevent duplicate Telegram messages.
+        PERIODIC_INTERVAL_SECONDS = 900  # 15 minutes
         try:
             while not self.stop_event.is_set():
                 self.stop_event.wait(timeout=PERIODIC_INTERVAL_SECONDS)
