@@ -19,13 +19,6 @@ logger = logging.getLogger(__name__)
 
 
 class SignalTracker:
-    """
-    In-memory deduplication cache keyed on (Symbol, Direction, Candle_Open_Time).
-
-    Guarantees exactly one notification per unique candle/direction combination
-    regardless of how many kline updates arrive for the same bar.  Stale
-    entries are pruned periodically to keep memory usage flat.
-    """
 
     def __init__(
         self,
@@ -39,13 +32,6 @@ class SignalTracker:
         self._last_cleanup: float = time.monotonic()
 
     def is_duplicate(self, symbol: str, direction: str, candle_open_time: int) -> bool:
-        """
-        Return True if this (symbol, direction, candle) combination was already
-        sent, and record it as sent if not.
-
-        This check-and-set is atomic under the lock so concurrent workers cannot
-        both clear the same key simultaneously.
-        """
         key = f"{symbol}-{direction}-{candle_open_time}"
         with self._lock:
             if key in self._seen:
@@ -54,7 +40,6 @@ class SignalTracker:
             return False
 
     def prune(self):
-        """Remove entries older than max_age_seconds. Called after each signal."""
         now_mono = time.monotonic()
         if now_mono - self._last_cleanup < self._cleanup_interval:
             return
@@ -72,24 +57,6 @@ class SignalTracker:
 
 
 class TradingEngine:
-    """
-    Signal orchestrator: WebSocket kline → analysis pipeline → Telegram.
-
-    Processing order per kline event
-    ---------------------------------
-    1.  validate kline structure
-    2.  update MarketData store  (every tick — price always current)
-    3.  GATE: skip unless candle is closed  (k["x"] is True)
-    4.  submit to SignalWorker thread pool (non-blocking)
-    5.  lazy-load history if insufficient bars
-    6.  per-symbol cooldown gate  (config.SIGNAL_COOLDOWN seconds)
-    7.  ConfluenceEngine.analyze()
-    8.  MTFTrendGuard validation
-    9.  SignalTracker deduplication  (symbol + direction + candle open time)
-    10. ATR TP/SL calculation
-    11. DB persistence
-    12. NotificationManager dispatch (with or without chart)
-    """
 
     def __init__(
         self,
@@ -115,23 +82,12 @@ class TradingEngine:
         )
         self._last_analyzed_candle: dict[tuple[str, str], int] = {}
 
-        # Instant-alert monitor state
         self._instant_alert_stop = threading.Event()
         self._instant_alert_thread: Optional[threading.Thread] = None
-        # Tracks previous indicator values per (symbol, interval) for crossover detection
         self._prev_rsi: dict[tuple[str, str], float] = {}
         self._prev_macd_above: dict[tuple[str, str], Optional[bool]] = {}
 
     def handle_kline(self, k: dict):
-        """
-        Entry-point for a raw kline dict from the Binance WebSocket.
-
-        Market data is updated on every tick so the OHLCV store stays current.
-        Signal analysis is submitted to the worker pool ONLY when the candle is
-        closed (``k["x"] is True``).  For a 15m bot this fires exactly once per
-        candle — preventing the same analysis from running hundreds of times on
-        every tick of the same forming bar.
-        """
         if not self._validate_kline(k):
             return
         self.market_data.update_kline(k)
@@ -154,7 +110,6 @@ class TradingEngine:
         return True
 
     def _process(self, symbol: str, interval: str, candle_open_time: int):
-        """Worker-thread wrapper — catches all exceptions so one symbol never kills others."""
         try:
             self._run_pipeline(symbol, interval, candle_open_time)
         except Exception as e:
@@ -164,20 +119,6 @@ class TradingEngine:
             )
 
     def _run_pipeline(self, symbol: str, interval: str, candle_open_time: int):
-        """Full signal pipeline for one symbol/interval/candle.
-
-        ``last_analyzed_candle`` guard
-        --------------------------------
-        Before doing any expensive work, the pipeline checks whether this exact
-        candle (identified by its open timestamp in milliseconds) has already
-        been processed for this symbol/interval pair.  If so it exits
-        immediately — this is the primary anti-spam defence against the same
-        closed candle being submitted more than once.
-
-        ``SignalTracker`` then provides a second layer of deduplication: even if
-        the pipeline does run, only one Telegram message per direction per candle
-        is ever sent.
-        """
         key = (symbol, interval)
 
         with self._lock:
@@ -394,23 +335,13 @@ class TradingEngine:
                 self._cooldowns[key] = wall_now
 
     def run_initial_analysis(self, symbols: list[str], interval: str) -> None:
-        """
-        Build and send a "System Online — Current Market Status" card for each
-        symbol immediately after startup.  Runs in the SignalWorker pool so it
-        never blocks the WebSocket startup.
-
-        Args:
-            symbols:  List of symbols to include (e.g. ['BTCUSDT', 'PIPPINUSDT']).
-            interval: Timeframe to analyse (e.g. '15m').
-        """
         self._pool.submit(self._send_startup_pulse, symbols, interval)
 
     def _send_startup_pulse(self, symbols: list[str], interval: str) -> None:
-        """Worker: build the startup status card and dispatch it via Telegram."""
         import datetime
         now_str = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
         lines = [
-            f"\U0001f7e2 Sistem Aktif — Pazar Durumu",
+            f"\U0001f7e2 Sistem Aktif \u2014 Pazar Durumu",
             f"Zaman: {now_str}",
             f"Mod: {'Simulasyon' if config.SIMULATION_MODE else 'Gercek Sinyal'}",
             "-" * 32,
@@ -425,10 +356,9 @@ class TradingEngine:
 
                 snap = Indicators.compute_snapshot(df)
                 if snap is None:
-                    lines.append(f"\u26a0\ufe0f {symbol}: Indikatör hesaplanamadi")
+                    lines.append(f"\u26a0\ufe0f {symbol}: Indikator hesaplanamadi")
                     continue
 
-                # Price formatting — handle very small prices (e.g. PIPPIN)
                 price = snap.close
                 if price < 0.01:
                     price_str = f"{price:.6f}"
@@ -439,7 +369,6 @@ class TradingEngine:
                 else:
                     price_str = f"{price:.2f}"
 
-                # EMA alignment
                 if snap.ema_9 > snap.ema_21 > snap.ema_50:
                     ema_status = "\U0001f4c8 Yukselis"
                 elif snap.ema_9 < snap.ema_21 < snap.ema_50:
@@ -447,7 +376,6 @@ class TradingEngine:
                 else:
                     ema_status = "\u27a1\ufe0f Notr"
 
-                # RSI zone
                 if snap.rsi < 30:
                     rsi_label = "Asiri Satim"
                 elif snap.rsi > 70:
@@ -455,10 +383,8 @@ class TradingEngine:
                 else:
                     rsi_label = "Normal"
 
-                # MACD momentum
                 macd_dir = "Yukari" if snap.histogram > 0 else "Asagi"
 
-                # Bollinger band position
                 bb_range = snap.bb_upper - snap.bb_lower
                 if bb_range > 0:
                     bb_pos = (price - snap.bb_lower) / bb_range * 100
@@ -483,35 +409,28 @@ class TradingEngine:
 
             except Exception as exc:
                 logger.error(f"Startup pulse error for {symbol}: {exc}", exc_info=True)
-                lines.append(f"\u274c {symbol}: Hata — {exc}")
+                lines.append(f"\u274c {symbol}: Hata \u2014 {exc}")
 
-        lines.append("Bu bir finansal tavsiye degildir.")
         msg = "\n".join(lines)
         self.notifier.send_raw_message(msg)
         logger.info("Startup pulse sent to Telegram")
 
     def run_periodic_check(self, symbols: list[str], interval: str) -> None:
-        """
-        Scheduled 5-minute check: run the full signal pipeline for each symbol
-        without waiting for a WebSocket candle-close event.
-
-        Respects the existing ``last_analyzed_candle`` dedup guard and
-        ``SIGNAL_COOLDOWN`` — no duplicate messages will be sent.
-
-        Args:
-            symbols:  Symbols to scan.
-            interval: Timeframe to analyse.
-        """
         for symbol in symbols:
             try:
                 df = self.market_data.get_klines(symbol, interval)
                 if df is None or len(df) < 2:
                     continue
-                # Use the open time of the latest bar as the candle identifier
-                candle_open_time = int(df.index[-1].timestamp() * 1000) if hasattr(df.index[-1], 'timestamp') else int(time.time() * 1000)
+                candle_open_time = (
+                    int(df.index[-1].timestamp() * 1000)
+                    if hasattr(df.index[-1], "timestamp")
+                    else int(time.time() * 1000)
+                )
                 self._pool.submit(self._process, symbol, interval, candle_open_time)
             except Exception as exc:
-                logger.error(f"Periodic check error for {symbol}: {exc}", exc_info=True)
+                logger.error(
+                    f"Periodic check error for {symbol}: {exc}", exc_info=True
+                )
 
     def start_instant_alert_monitor(
         self,
@@ -519,22 +438,6 @@ class TradingEngine:
         interval: str,
         poll_seconds: int = 60,
     ) -> None:
-        """
-        Start a background thread that checks for volatility spikes and major
-        indicator crossovers every ``poll_seconds`` seconds.
-
-        Triggers an immediate full pipeline run (bypassing the 10-min scheduled
-        wait) when any of the following conditions are detected:
-
-        - **ATR Spike**: current ATR > 1.5 × ATR SMA (20-period)
-        - **RSI Breakout**: RSI crosses above 70 or below 30 since last poll
-        - **MACD Crossover**: MACD line crosses above or below the signal line
-
-        Args:
-            symbols:      Symbols to monitor.
-            interval:     Timeframe to sample.
-            poll_seconds: How often to poll (default 60 s).
-        """
         if self._instant_alert_thread and self._instant_alert_thread.is_alive():
             logger.debug("Instant alert monitor already running")
             return
@@ -557,7 +460,6 @@ class TradingEngine:
         interval: str,
         poll_seconds: int,
     ) -> None:
-        """Background loop: detect spikes/crossovers and fire the pipeline."""
         while not self._instant_alert_stop.wait(timeout=poll_seconds):
             for symbol in symbols:
                 try:
@@ -569,10 +471,6 @@ class TradingEngine:
                     )
 
     def _check_instant_alert(self, symbol: str, interval: str) -> None:
-        """
-        Sample the latest indicator snapshot and fire the pipeline immediately
-        if a spike or crossover condition is met.
-        """
         df = self.market_data.get_klines(symbol, interval)
         if df is None or len(df) < 30:
             return
@@ -585,14 +483,12 @@ class TradingEngine:
         triggered = False
         reasons: list[str] = []
 
-        # 1. ATR Spike: current ATR > 1.5x its own SMA
         if snap.atr_sma > 0 and snap.atr > snap.atr_sma * 1.5:
             triggered = True
             reasons.append(
                 f"ATR Spike ({snap.atr:.4f} > 1.5x SMA {snap.atr_sma:.4f})"
             )
 
-        # 2. RSI Crossover of 30 / 70 thresholds
         prev_rsi = self._prev_rsi.get(key)
         if prev_rsi is not None:
             if prev_rsi >= 30 > snap.rsi:
@@ -609,7 +505,6 @@ class TradingEngine:
                 reasons.append(f"RSI dropped below 70 ({snap.rsi:.1f})")
         self._prev_rsi[key] = snap.rsi
 
-        # 3. MACD Crossover (line crosses signal)
         macd_above = snap.macd_line > snap.signal_line
         prev_macd_above = self._prev_macd_above.get(key)
         if prev_macd_above is not None and macd_above != prev_macd_above:
@@ -628,42 +523,11 @@ class TradingEngine:
                 f"[InstantAlert] {symbol}-{interval} triggered: "
                 + "; ".join(reasons)
             )
-            # Force re-analysis by clearing the last-candle cache for this key
             with self._lock:
                 self._last_analyzed_candle.pop(key, None)
             self._pool.submit(self._process, symbol, interval, candle_open_time)
 
-    def run_periodic_check(self, symbols: list[str], interval: str) -> None:
-        """
-        Scheduled 10-minute check: run the full signal pipeline for each symbol
-        without waiting for a WebSocket candle-close event.
-
-        Respects the existing ``last_analyzed_candle`` dedup guard and
-        ``SIGNAL_COOLDOWN`` — no duplicate messages will be sent.
-
-        Args:
-            symbols:  Symbols to scan.
-            interval: Timeframe to analyse.
-        """
-        for symbol in symbols:
-            try:
-                df = self.market_data.get_klines(symbol, interval)
-                if df is None or len(df) < 2:
-                    continue
-                # Use the open time of the latest bar as the candle identifier
-                candle_open_time = (
-                    int(df.index[-1].timestamp() * 1000)
-                    if hasattr(df.index[-1], "timestamp")
-                    else int(time.time() * 1000)
-                )
-                self._pool.submit(self._process, symbol, interval, candle_open_time)
-            except Exception as exc:
-                logger.error(
-                    f"Periodic check error for {symbol}: {exc}", exc_info=True
-                )
-
     def shutdown(self):
-        """Gracefully shut down the signal worker thread pool and monitor."""
         logger.info("TradingEngine: shutting down")
         self._instant_alert_stop.set()
         if self._instant_alert_thread and self._instant_alert_thread.is_alive():

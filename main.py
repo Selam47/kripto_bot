@@ -1,14 +1,3 @@
-"""
-main.py — Single Entry Point
-==============================
-Start the bot:
-    python main.py
-
-Execution modes (set in .env):
-    SIMULATION_MODE=1   — signals sent, no real orders
-    DATA_TESTING=1      — synthetic data, no WebSocket
-"""
-
 import logging
 import logging.handlers
 import os
@@ -43,6 +32,8 @@ else:
 
 logger = logging.getLogger(__name__)
 
+ALLOWED_SYMBOLS = ["BTCUSDT", "PIPPINUSDT"]
+
 
 def setup_logging() -> None:
     os.makedirs("logs", exist_ok=True)
@@ -63,25 +54,6 @@ def setup_logging() -> None:
 
 
 def _run_telegram_command_server(stop_event: threading.Event) -> None:
-    """
-    Run the ONE AND ONLY ``telegram.ext.Application`` in a dedicated thread.
-
-    This is the single source of truth for Telegram bot polling.  No other
-    module creates an Application — doing so would cause ``Conflict: 409``
-    errors from two simultaneous ``getUpdates`` calls.
-
-    Boot sequence
-    -------------
-    1. Create a new ``asyncio`` event loop (isolated from all other threads).
-    2. Build the Application with the bot token.
-    3. Register /start /durum /coinler /hakkinda command handlers.
-    4. ``initialize()`` the application.
-    5. ``bot.delete_webhook(drop_pending_updates=True)`` — clears any ghost
-       webhook/session left over from a previous run.
-    6. ``start()`` + ``updater.start_polling(drop_pending_updates=True)``.
-    7. ``loop.run_forever()`` until ``stop_event`` fires.
-    8. Async teardown: ``updater.stop()`` → ``app.stop()`` → ``app.shutdown()``.
-    """
     import asyncio as _asyncio
 
     _logger = logging.getLogger("TelegramCmdServer")
@@ -118,14 +90,10 @@ def _run_telegram_command_server(stop_event: threading.Event) -> None:
 
         await app.initialize()
 
-        # ── CONFLICT FIX ───────────────────────────────────────────────────
-        # delete_webhook clears any previous webhook or ghost getUpdates
-        # session.  drop_pending_updates=True discards stale messages so the
-        # first poll starts from a clean state.
         try:
             await app.bot.delete_webhook(drop_pending_updates=True)
             _logger.info("delete_webhook OK (drop_pending_updates=True)")
-            await _asyncio.sleep(0.5)   # brief pause before first getUpdates
+            await _asyncio.sleep(0.5)
         except Exception as wh_err:
             _logger.warning(f"delete_webhook failed (non-fatal): {wh_err}")
 
@@ -146,7 +114,6 @@ def _run_telegram_command_server(stop_event: threading.Event) -> None:
 
     try:
         loop.run_until_complete(_boot())
-        # Poll until stop_event is set, checking every second
         while not stop_event.is_set():
             loop.run_until_complete(_asyncio.sleep(1))
     except Exception as exc:
@@ -156,7 +123,6 @@ def _run_telegram_command_server(stop_event: threading.Event) -> None:
             loop.run_until_complete(_shutdown())
         except Exception:
             pass
-        # Cancel any remaining tasks so the loop closes without RuntimeError
         pending = _asyncio.all_tasks(loop)
         if pending:
             for t in pending:
@@ -167,22 +133,15 @@ def _run_telegram_command_server(stop_event: threading.Event) -> None:
 
 
 def delete_webhook() -> None:
-    """
-    Call the Telegram deleteWebhook endpoint before starting long-polling.
-
-    This clears any previously registered webhook so that getUpdates
-    (long-polling) can receive messages without conflicts.  Runs synchronously
-    at boot time and is safe to call even if no webhook exists.
-    """
     url = config.TELEGRAM_DELETE_WEBHOOK_URL
     if not url:
         logger.warning("TELEGRAM_BOT_TOKEN not set — skipping deleteWebhook")
         return
     try:
-        resp = requests.post(url, timeout=10)
+        resp = requests.post(url, json={"drop_pending_updates": True}, timeout=10)
         data = resp.json()
         if data.get("ok"):
-            logger.info("Telegram webhook cleared (deleteWebhook OK)")
+            logger.info("Telegram webhook cleared (deleteWebhook OK, drop_pending_updates=True)")
         else:
             logger.warning(f"deleteWebhook returned: {data.get('description', data)}")
     except Exception as exc:
@@ -198,8 +157,6 @@ def _validate_config() -> bool:
         errors.append("Telegram credentials missing (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)")
     if not config.TIMEFRAMES:
         errors.append("No timeframes configured (TIMEFRAMES)")
-    if not config.SYMBOLS:
-        errors.append("No symbols configured (SYMBOLS)")
     if config.HISTORY_CANDLES <= 0:
         errors.append("HISTORY_CANDLES must be a positive integer")
     elif config.HISTORY_CANDLES > 1500:
@@ -222,14 +179,6 @@ def _validate_config() -> bool:
 
 
 class AppRunner:
-    """
-    Top-level lifecycle controller.
-
-    Boot order:
-        deleteWebhook → validate config → Database → SymbolManager →
-        NotificationManager → MarketData (bulk-load) → TradingEngine →
-        BinanceWS → main sleep loop
-    """
 
     def __init__(self) -> None:
         if config.DB_ENABLE_PERSISTENCE:
@@ -271,7 +220,6 @@ class AppRunner:
                 daemon=True,
             )
 
-        # Single Telegram command server — created here, started in run()
         self._cmd_server_stop = threading.Event()
         self._cmd_server_thread: threading.Thread | None = None
 
@@ -281,7 +229,6 @@ class AppRunner:
         logger.info("Shutdown signal received — stopping all subsystems...")
         self.is_shutting_down.set()
 
-        # Stop Telegram command server first (signals its loop to exit)
         self._cmd_server_stop.set()
 
         if self.ws:
@@ -299,7 +246,6 @@ class AppRunner:
         if self.db:
             self.db.close()
 
-        # Wait for the command server thread to finish (max 8 s)
         if self._cmd_server_thread and self._cmd_server_thread.is_alive():
             self._cmd_server_thread.join(timeout=8)
 
@@ -307,17 +253,10 @@ class AppRunner:
         logger.info("Shutdown complete")
 
     def run(self) -> None:
-        # ── Antigravity Engine: Simulation Mode enforced ───────────────────────
-        # Per spec: TRADING_MODE = 0 (Simulation). Override env var at runtime
-        # so all signals carry the [SIMULATION] prefix regardless of .env.
         import config as _cfg
         _cfg.SIMULATION_MODE = True
 
-        # The two symbols this engine specifically optimises for.
-        # Sources from config (SYMBOLS env var) but always includes these two.
-        monitored_symbols = list(
-            dict.fromkeys(["BTCUSDT", "PIPPINUSDT"] + list(config.SYMBOLS))
-        )
+        monitored_symbols = list(ALLOWED_SYMBOLS)
         primary_interval = config.TIMEFRAMES[0] if config.TIMEFRAMES else "15m"
 
         mode = "SIMULATION" if config.SIMULATION_MODE else "LIVE TRADING"
@@ -339,9 +278,6 @@ class AppRunner:
         self.symbol_manager.start()
         self.notifier.start()
 
-        # ── Telegram Command Server ─────────────────────────────────────────
-        # One Application, one polling loop, one thread.  This is the ONLY
-        # place a bot instance is created — guaranteeing no Conflict: 409.
         self._cmd_server_thread = threading.Thread(
             target=_run_telegram_command_server,
             args=(self._cmd_server_stop,),
@@ -370,16 +306,9 @@ class AppRunner:
             charting_service=self.charting_service,
         )
 
-        symbols = self.symbol_manager.get_symbols()
-
-        if config.FILTER_BY_MARKET_CAP and symbols:
-            min_cap = int(os.getenv("MIN_MARKET_CAP", "10000000000"))
-            symbols = self.risk_manager.filter_symbols_by_market_cap(symbols, min_cap)
-            if not symbols:
-                logger.error("No symbols remaining after market-cap filter — aborting")
-                self.shutdown_handler(None, None)
-                return
-            logger.info(f"Market-cap filter retained {len(symbols)} symbols")
+        symbols = [s for s in self.symbol_manager.get_symbols() if s in ALLOWED_SYMBOLS]
+        if not symbols:
+            symbols = list(ALLOWED_SYMBOLS)
 
         self.ws = BinanceWS(
             symbol_to_subs=symbols,
@@ -391,24 +320,14 @@ class AppRunner:
 
         self.ws.run()
 
-        # ── Startup Pulse ──────────────────────────────────────────────────────
-        # Fire a "System Online — Current Market Status" message immediately.
-        # Runs in a daemon thread so it never delays WebSocket initialisation.
         logger.info("Dispatching startup market-status pulse...")
         self.engine.run_initial_analysis(monitored_symbols, primary_interval)
 
-        # ── Instant Alert Monitor ────────────────────────────────────
-        # 60-second background thread: fires the pipeline immediately on
-        # ATR spike, RSI 30/70 crossover, or MACD line/signal crossover.
         self.engine.start_instant_alert_monitor(
             monitored_symbols, primary_interval, poll_seconds=60
         )
 
-        # ── 15-Minute Periodic Analysis Loop ──────────────────────────────────
-        # Scheduled full scan every 15 minutes (at least 1 analysis per hour).
-        # Belt-and-suspenders to the Instant Alert monitor. Dedup guard and
-        # cooldown inside TradingEngine prevent duplicate Telegram messages.
-        PERIODIC_INTERVAL_SECONDS = 900  # 15 minutes
+        PERIODIC_INTERVAL_SECONDS = 900
         try:
             while not self.stop_event.is_set():
                 self.stop_event.wait(timeout=PERIODIC_INTERVAL_SECONDS)
@@ -471,7 +390,7 @@ def _run_data_testing() -> None:
         charting_service=charting_service,
     )
 
-    test_symbols = config.SYMBOLS if config.SYMBOLS else ["PIPPINUSDT"]
+    test_symbols = list(ALLOWED_SYMBOLS)
     fake_candle_time = int(time.time() * 1000)
 
     for symbol in test_symbols:
