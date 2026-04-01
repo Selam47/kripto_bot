@@ -1,8 +1,13 @@
 """
-Notification Manager — Async Telegram Gateway
-===============================================
-Handles all outbound Telegram communication and inbound command handling in a
-single dedicated ``asyncio`` event loop running on a background daemon thread.
+Notification Manager — Pure Telegram Sender
+============================================
+Handles all **outbound** Telegram communication in a single dedicated
+``asyncio`` event loop running on a background daemon thread.
+
+Command handling (/start, /durum, etc.) is intentionally NOT done here.
+A single ``telegram.ext.Application`` is created and polled exclusively
+from ``main.py`` (``TelegramCommandServer``) to avoid Conflict: 409 errors
+that arise when more than one ``getUpdates`` loop is active.
 
 Features
 --------
@@ -13,9 +18,6 @@ Features
   across all requests to minimise TCP overhead.
 - **Retry logic**: every send is retried up to 3 times with linear back-off;
   a sync ``requests`` fallback fires on loop failure.
-- **Telegram commands**: ``/start``, ``/durum``, ``/coinler``, ``/hakkinda``
-  are registered via ``python-telegram-bot`` and polled inside the same event
-  loop using the Application's low-level async API.
 - **Singleton**: only one instance is created per process.
 
 Thread safety
@@ -199,60 +201,17 @@ class NotificationManager:
 
     async def _bootstrap(self, ready_event: threading.Event):
         """
-        Async initialisation: create aiohttp session and start Telegram polling.
+        Async initialisation: create the aiohttp session for outbound messages.
+
+        Command handling is NOT started here — a single Application is created
+        and polled exclusively from ``main.py`` (``TelegramCommandServer``).
 
         Args:
             ready_event: Signalled once initialisation is complete.
         """
         timeout = aiohttp.ClientTimeout(total=20)
         self._session = aiohttp.ClientSession(timeout=timeout)
-
-        if config.TELEGRAM_BOT_TOKEN:
-            await self._start_command_polling()
-
         ready_event.set()
-
-    async def _start_command_polling(self):
-        """
-        Register Telegram command handlers and start the updater.
-
-        Commands registered
-        -------------------
-        - ``/start``    — Welcome message and command list.
-        - ``/durum``    — Current bot status.
-        - ``/coinler``  — List of tracked coins.
-        - ``/hakkinda`` — About the bot.
-        """
-        try:
-            from telegram.ext import Application, CommandHandler
-
-            app = (
-                Application.builder()
-                .token(config.TELEGRAM_BOT_TOKEN)
-                .build()
-            )
-
-            app.add_handler(CommandHandler("start", _cmd_start))
-            app.add_handler(CommandHandler("durum", _cmd_durum))
-            app.add_handler(CommandHandler("coinler", _cmd_coinler))
-            app.add_handler(CommandHandler("hakkinda", _cmd_hakkinda))
-
-            await app.initialize()
-
-            try:
-                await app.bot.delete_webhook(drop_pending_updates=True)
-                logger.info("Telegram webhook cleared — drop_pending_updates=True")
-                await asyncio.sleep(1.0)
-            except Exception as wh_err:
-                logger.warning(f"delete_webhook (PTB) failed (non-fatal): {wh_err}")
-
-            await app.start()
-            await app.updater.start_polling(drop_pending_updates=True)
-
-            self._tg_app = app
-            logger.info("Telegram command polling started (/start /durum /coinler /hakkinda)")
-        except Exception as e:
-            logger.warning(f"Telegram command polling unavailable: {e}")
 
     def stop(self):
         """
@@ -304,17 +263,11 @@ class NotificationManager:
 
     async def _cleanup(self):
         """
-        Async teardown: stop Telegram polling and close the HTTP session.
-        """
-        if self._tg_app:
-            try:
-                await self._tg_app.updater.stop()
-                await self._tg_app.stop()
-                await self._tg_app.shutdown()
-            except Exception as e:
-                logger.debug(f"Telegram app cleanup: {e}")
-            self._tg_app = None
+        Async teardown: close the aiohttp session.
 
+        Command polling teardown is handled by ``TelegramCommandServer`` in
+        ``main.py``, not here.
+        """
         if self._session and not self._session.closed:
             await self._session.close()
             self._session = None

@@ -62,6 +62,110 @@ def setup_logging() -> None:
     logging.basicConfig(level=logging.INFO, format=fmt, handlers=handlers)
 
 
+def _run_telegram_command_server(stop_event: threading.Event) -> None:
+    """
+    Run the ONE AND ONLY ``telegram.ext.Application`` in a dedicated thread.
+
+    This is the single source of truth for Telegram bot polling.  No other
+    module creates an Application — doing so would cause ``Conflict: 409``
+    errors from two simultaneous ``getUpdates`` calls.
+
+    Boot sequence
+    -------------
+    1. Create a new ``asyncio`` event loop (isolated from all other threads).
+    2. Build the Application with the bot token.
+    3. Register /start /durum /coinler /hakkinda command handlers.
+    4. ``initialize()`` the application.
+    5. ``bot.delete_webhook(drop_pending_updates=True)`` — clears any ghost
+       webhook/session left over from a previous run.
+    6. ``start()`` + ``updater.start_polling(drop_pending_updates=True)``.
+    7. ``loop.run_forever()`` until ``stop_event`` fires.
+    8. Async teardown: ``updater.stop()`` → ``app.stop()`` → ``app.shutdown()``.
+    """
+    import asyncio as _asyncio
+
+    _logger = logging.getLogger("TelegramCmdServer")
+
+    if not config.TELEGRAM_BOT_TOKEN:
+        _logger.warning("TELEGRAM_BOT_TOKEN not set — command server disabled")
+        return
+
+    try:
+        from telegram.ext import Application, CommandHandler
+        from engine.notification_manager import (
+            _cmd_start, _cmd_durum, _cmd_coinler, _cmd_hakkinda,
+        )
+    except ImportError as exc:
+        _logger.error(f"Telegram import failed: {exc}")
+        return
+
+    loop = _asyncio.new_event_loop()
+    _asyncio.set_event_loop(loop)
+
+    app: Application | None = None
+
+    async def _boot():
+        nonlocal app
+        app = (
+            Application.builder()
+            .token(config.TELEGRAM_BOT_TOKEN)
+            .build()
+        )
+        app.add_handler(CommandHandler("start", _cmd_start))
+        app.add_handler(CommandHandler("durum", _cmd_durum))
+        app.add_handler(CommandHandler("coinler", _cmd_coinler))
+        app.add_handler(CommandHandler("hakkinda", _cmd_hakkinda))
+
+        await app.initialize()
+
+        # ── CONFLICT FIX ───────────────────────────────────────────────────
+        # delete_webhook clears any previous webhook or ghost getUpdates
+        # session.  drop_pending_updates=True discards stale messages so the
+        # first poll starts from a clean state.
+        try:
+            await app.bot.delete_webhook(drop_pending_updates=True)
+            _logger.info("delete_webhook OK (drop_pending_updates=True)")
+            await _asyncio.sleep(0.5)   # brief pause before first getUpdates
+        except Exception as wh_err:
+            _logger.warning(f"delete_webhook failed (non-fatal): {wh_err}")
+
+        await app.start()
+        await app.updater.start_polling(drop_pending_updates=True)
+        _logger.info("Telegram command polling started (/start /durum /coinler /hakkinda)")
+
+    async def _shutdown():
+        if app is None:
+            return
+        try:
+            await app.updater.stop()
+            await app.stop()
+            await app.shutdown()
+            _logger.info("Telegram command server shut down cleanly")
+        except Exception as exc:
+            _logger.debug(f"Telegram shutdown error (non-fatal): {exc}")
+
+    try:
+        loop.run_until_complete(_boot())
+        # Poll until stop_event is set, checking every second
+        while not stop_event.is_set():
+            loop.run_until_complete(_asyncio.sleep(1))
+    except Exception as exc:
+        _logger.error(f"Telegram command server crashed: {exc}", exc_info=True)
+    finally:
+        try:
+            loop.run_until_complete(_shutdown())
+        except Exception:
+            pass
+        # Cancel any remaining tasks so the loop closes without RuntimeError
+        pending = _asyncio.all_tasks(loop)
+        if pending:
+            for t in pending:
+                t.cancel()
+            loop.run_until_complete(_asyncio.gather(*pending, return_exceptions=True))
+        loop.close()
+        _logger.info("Telegram event loop closed")
+
+
 def delete_webhook() -> None:
     """
     Call the Telegram deleteWebhook endpoint before starting long-polling.
@@ -167,11 +271,18 @@ class AppRunner:
                 daemon=True,
             )
 
+        # Single Telegram command server — created here, started in run()
+        self._cmd_server_stop = threading.Event()
+        self._cmd_server_thread: threading.Thread | None = None
+
     def shutdown_handler(self, signum, frame) -> None:
         if self.is_shutting_down.is_set():
             return
         logger.info("Shutdown signal received — stopping all subsystems...")
         self.is_shutting_down.set()
+
+        # Stop Telegram command server first (signals its loop to exit)
+        self._cmd_server_stop.set()
 
         if self.ws:
             self.ws.stop()
@@ -187,6 +298,10 @@ class AppRunner:
             self.db_maintenance.stop()
         if self.db:
             self.db.close()
+
+        # Wait for the command server thread to finish (max 8 s)
+        if self._cmd_server_thread and self._cmd_server_thread.is_alive():
+            self._cmd_server_thread.join(timeout=8)
 
         self.stop_event.set()
         logger.info("Shutdown complete")
@@ -223,6 +338,18 @@ class AppRunner:
 
         self.symbol_manager.start()
         self.notifier.start()
+
+        # ── Telegram Command Server ─────────────────────────────────────────
+        # One Application, one polling loop, one thread.  This is the ONLY
+        # place a bot instance is created — guaranteeing no Conflict: 409.
+        self._cmd_server_thread = threading.Thread(
+            target=_run_telegram_command_server,
+            args=(self._cmd_server_stop,),
+            name="TelegramCmdServer",
+            daemon=True,
+        )
+        self._cmd_server_thread.start()
+        logger.info("Telegram command server thread started")
 
         if self.charting_service:
             self.charting_service.start()
