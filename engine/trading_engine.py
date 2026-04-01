@@ -112,6 +112,7 @@ class TradingEngine:
             max_age_seconds=max(config.SIGNAL_COOLDOWN * 2, 28800),
             cleanup_interval_seconds=600,
         )
+        self._last_analyzed_candle: dict[tuple[str, str], int] = {}
 
     def handle_kline(self, k: dict):
         """
@@ -155,7 +156,31 @@ class TradingEngine:
             )
 
     def _run_pipeline(self, symbol: str, interval: str, candle_open_time: int):
-        """Full signal pipeline for one symbol/interval/candle."""
+        """Full signal pipeline for one symbol/interval/candle.
+
+        ``last_analyzed_candle`` guard
+        --------------------------------
+        Before doing any expensive work, the pipeline checks whether this exact
+        candle (identified by its open timestamp in milliseconds) has already
+        been processed for this symbol/interval pair.  If so it exits
+        immediately — this is the primary anti-spam defence against the same
+        closed candle being submitted more than once.
+
+        ``SignalTracker`` then provides a second layer of deduplication: even if
+        the pipeline does run, only one Telegram message per direction per candle
+        is ever sent.
+        """
+        key = (symbol, interval)
+
+        with self._lock:
+            if self._last_analyzed_candle.get(key) == candle_open_time:
+                logger.debug(
+                    "Candle %d already processed for %s-%s — skipping",
+                    candle_open_time, symbol, interval,
+                )
+                return
+            self._last_analyzed_candle[key] = candle_open_time
+
         min_candles = 20 if (config.SIMULATION_MODE or config.DATA_TESTING) else 50
 
         df = self.market_data.get_klines(symbol, interval)
@@ -167,7 +192,6 @@ class TradingEngine:
         if len(df) < min_candles:
             return
 
-        key = (symbol, interval)
         wall_now = time.time()
 
         cooldown = 0.0 if config.DATA_TESTING else float(config.SIGNAL_COOLDOWN)

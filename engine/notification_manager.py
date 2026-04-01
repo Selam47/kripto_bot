@@ -155,6 +155,17 @@ class NotificationManager:
         """
         Entry point for the background notification thread.
 
+        Shutdown sequence
+        -----------------
+        1. ``_bootstrap`` initialises the session and starts Telegram polling.
+        2. ``run_forever()`` blocks until ``loop.stop()`` is called externally.
+        3. ``_cleanup`` stops polling and closes the aiohttp session.
+        4. Any remaining asyncio tasks are cancelled and awaited so Python can
+           garbage-collect them without raising ``RuntimeError: Event loop is
+           closed`` on pending futures.
+        5. The loop is closed only after all tasks have finished or been
+           cancelled — never before.
+
         Args:
             ready_event: Set once the loop is up and the session is initialised.
         """
@@ -166,10 +177,25 @@ class NotificationManager:
             logger.error(f"Notification loop crashed: {e}", exc_info=True)
         finally:
             try:
-                self._loop.run_until_complete(self._cleanup())
-            except Exception:
-                pass
-            self._loop.close()
+                if not self._loop.is_closed():
+                    self._loop.run_until_complete(self._cleanup())
+            except Exception as e:
+                logger.debug(f"Cleanup coroutine error during shutdown: {e}")
+            finally:
+                if not self._loop.is_closed():
+                    pending = asyncio.all_tasks(self._loop)
+                    if pending:
+                        logger.debug(f"Cancelling {len(pending)} pending async task(s)")
+                        for task in pending:
+                            task.cancel()
+                        try:
+                            self._loop.run_until_complete(
+                                asyncio.gather(*pending, return_exceptions=True)
+                            )
+                        except Exception:
+                            pass
+                    self._loop.close()
+                    logger.info("Notification event loop closed cleanly")
 
     async def _bootstrap(self, ready_event: threading.Event):
         """
@@ -216,6 +242,7 @@ class NotificationManager:
             try:
                 await app.bot.delete_webhook(drop_pending_updates=True)
                 logger.info("Telegram webhook cleared — drop_pending_updates=True")
+                await asyncio.sleep(1.0)
             except Exception as wh_err:
                 logger.warning(f"delete_webhook (PTB) failed (non-fatal): {wh_err}")
 
@@ -231,18 +258,20 @@ class NotificationManager:
         """
         Gracefully stop the notification manager.
 
-        Stops Telegram polling, closes the aiohttp session, signals the event
-        loop to stop, and joins the background thread.
+        Signals the event loop to stop and waits for the background thread to
+        finish.  All async teardown (Telegram polling, aiohttp session) is
+        performed inside ``_run_loop``'s ``finally`` block so there is exactly
+        one cleanup path and no race between a submitted coroutine and the loop
+        closing.
         """
         logger.info("Stopping NotificationManager...")
         self._stop_event.set()
 
-        if self._loop and self._loop.is_running():
-            asyncio.run_coroutine_threadsafe(self._cleanup(), self._loop)
+        if self._loop and not self._loop.is_closed() and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._loop.stop)
 
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=8)
+            self._thread.join(timeout=10)
 
         logger.info("NotificationManager stopped")
 
@@ -303,7 +332,12 @@ class NotificationManager:
         if config.SIMULATION_MODE:
             msg = f"[SIMULATION]\n{msg}"
 
-        if self._loop and self._loop.is_running():
+        loop_alive = (
+            self._loop is not None
+            and not self._loop.is_closed()
+            and self._loop.is_running()
+        )
+        if loop_alive:
             asyncio.run_coroutine_threadsafe(
                 self._async_send(msg, chart_path), self._loop
             )
