@@ -388,7 +388,8 @@ async def _cmd_start(update, context):
         "/start    — Bu mesaj\n"
         "/durum    — Bot durumu\n"
         "/coinler  — Takip edilen coinler\n"
-        "/hakkinda — Bot hakkinda",
+        "/hakkinda — Bot hakkinda\n"
+        "/ip       — Sunucu IP adresi",
         parse_mode="Markdown",
     )
 
@@ -428,3 +429,14 @@ async def _cmd_hakkinda(update, context):
         "Kendi arastirmanizi yapin.",
         parse_mode="Markdown",
     )
+
+
+async def _cmd_ip(update, context):
+    import requests as _requests
+    try:
+        resp = _requests.get("https://api.ipify.org", timeout=10)
+        resp.raise_for_status()
+        ip_addr = resp.text.strip()
+        await update.message.reply_text(f"Public IP: `{ip_addr}`", parse_mode="Markdown")
+    except Exception as exc:
+        await update.message.reply_text(f"IP alinamadi: {exc}")

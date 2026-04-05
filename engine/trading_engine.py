@@ -277,7 +277,6 @@ class TradingEngine:
             if wall_now - last_ts < cooldown:
                 return True
 
-            self._cooldowns[key] = wall_now
             return False
 
     def _dispatch_with_chart(
@@ -426,6 +425,9 @@ class TradingEngine:
                     if hasattr(df.index[-1], "timestamp")
                     else int(time.time() * 1000)
                 )
+                key = (symbol, interval)
+                with self._lock:
+                    self._last_analyzed_candle.pop(key, None)
                 self._pool.submit(self._process, symbol, interval, candle_open_time)
             except Exception as exc:
                 logger.error(

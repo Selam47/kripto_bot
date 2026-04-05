@@ -65,7 +65,7 @@ def _run_telegram_command_server(stop_event: threading.Event) -> None:
     try:
         from telegram.ext import Application, CommandHandler
         from engine.notification_manager import (
-            _cmd_start, _cmd_durum, _cmd_coinler, _cmd_hakkinda,
+            _cmd_start, _cmd_durum, _cmd_coinler, _cmd_hakkinda, _cmd_ip,
         )
     except ImportError as exc:
         _logger.error(f"Telegram import failed: {exc}")
@@ -87,6 +87,7 @@ def _run_telegram_command_server(stop_event: threading.Event) -> None:
         app.add_handler(CommandHandler("durum", _cmd_durum))
         app.add_handler(CommandHandler("coinler", _cmd_coinler))
         app.add_handler(CommandHandler("hakkinda", _cmd_hakkinda))
+        app.add_handler(CommandHandler("ip", _cmd_ip))
 
         await app.initialize()
 
@@ -99,7 +100,7 @@ def _run_telegram_command_server(stop_event: threading.Event) -> None:
 
         await app.start()
         await app.updater.start_polling(drop_pending_updates=True)
-        _logger.info("Telegram command polling started (/start /durum /coinler /hakkinda)")
+        _logger.info("Telegram command polling started (/start /durum /coinler /hakkinda /ip)")
 
     async def _shutdown():
         if app is None:
@@ -327,7 +328,7 @@ class AppRunner:
             monitored_symbols, primary_interval, poll_seconds=60
         )
 
-        PERIODIC_INTERVAL_SECONDS = 900
+        PERIODIC_INTERVAL_SECONDS = 3600
         try:
             while not self.stop_event.is_set():
                 self.stop_event.wait(timeout=PERIODIC_INTERVAL_SECONDS)
